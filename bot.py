@@ -323,6 +323,39 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
     return partial[:50]
 
 
+# ヘルパー: 入力からロールオブジェクトを探す（resolve_target_members が見つけられなかった場合の補助）
+def _find_role_from_input(raw: str, guild: discord.Guild) -> Optional[discord.Role]:
+    if not guild:
+        return None
+    s = raw.strip()
+    # mention形式
+    m = re.match(r'^<@&(?P<id>\d+)>$', s)
+    if m:
+        return guild.get_role(int(m.group("id")))
+    # idのみ
+    if s.isdigit():
+        r = guild.get_role(int(s))
+        if r:
+            return r
+    # @で始まる名前（半角/全角@許容）
+    name = s.lstrip("@\uFF20").strip()
+    if name:
+        # 完全一致
+        role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
+        if role:
+            return role
+        # 先頭一致 -> 部分一致
+        starts = [r for r in guild.roles if r.name.lower().startswith(name.lower())]
+        if starts:
+            return starts[0]
+        contains = [r for r in guild.roles if name.lower() in r.name.lower()]
+        if contains:
+            return contains[0]
+    # 最終手段: プレーン文字列をロール名として探す（完全一致）
+    role = discord.utils.find(lambda r: r.name.lower() == s.lower(), guild.roles)
+    return role
+
+
 # ---------- /配布（付与）（修正版：ロール存在チェックとDB安全化含む） ----------
 @tree.command(name="配布", description="指定したユーザーやロールにRaruinを付与（管理者専用）")
 @app_commands.describe(target="ユーザー（@で指定可）またはロール名/ID/ユーザー名", amount="付与額")
@@ -337,13 +370,19 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
 
     members = await resolve_target_members(target, interaction)
 
-    # ロールだがメンバーがいないケースの通知
-    if (target.strip().startswith("@") or target.strip().startswith("＠")):
-        name = target.strip().lstrip("@\uFF20").strip()
-        role_obj = discord.utils.find(lambda r: r.name.lower() == name.lower(), interaction.guild.roles)
-        if role_obj and len(role_obj.members) == 0:
-            await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
-            return
+    # members が空なら、改めて「ロールとして存在するか」をチェックしてユーザ向けメッセージを出す
+    if not members:
+        # guild が存在するか確認
+        guild = interaction.guild
+        if guild:
+            role_obj = _find_role_from_input(target, guild)
+            if role_obj:
+                # ロールは見つかったがメンバー0 のケース
+                if len(role_obj.members) == 0:
+                    await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
+                    return
+                # ロールにはメンバーがいる（resolve が失敗していた可能性） -> そのメンバーを使う
+                members = role_obj.members
 
     if not members:
         await interaction.response.send_message("❌ 対象が見つかりませんでした。@メンション / ID / ロール名 / ユーザー名 を試してください。", ephemeral=True)
@@ -371,6 +410,7 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
         name = f"{len(members)} 件のメンバー"
     await interaction.response.send_message(f"🎁 {name} に {amount} Raruin を付与しました。")
 
+
 # ---------- /支払い（減算）（修正版：ロール存在チェックとDB安全化含む） ----------
 @tree.command(name="支払い", description="指定したユーザーやロールのRaruinを減らす（管理者専用）")
 @app_commands.describe(target="ユーザー（@で指定可）またはロール名/ID/ユーザー名", amount="減らす額")
@@ -385,14 +425,16 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
 
     members = await resolve_target_members(target, interaction)
 
-    # 追加チェック：もし target が @... 形式でロール名にマッチしたがメンバー0の場合は明示する
-    if (target.strip().startswith("@") or target.strip().startswith("＠")):
-        # ロールオブジェクトだけ確かめたい場合
-        name = target.strip().lstrip("@\uFF20").strip()
-        role_obj = discord.utils.find(lambda r: r.name.lower() == name.lower(), interaction.guild.roles)
-        if role_obj and len(role_obj.members) == 0:
-            await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
-            return
+    # members が空ならロール存在チェック（改善）
+    if not members:
+        guild = interaction.guild
+        if guild:
+            role_obj = _find_role_from_input(target, guild)
+            if role_obj:
+                if len(role_obj.members) == 0:
+                    await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
+                    return
+                members = role_obj.members
 
     if not members:
         await interaction.response.send_message("❌ 対象が見つかりませんでした。@メンション / ID / ロール名 / ユーザー名 を試してください。", ephemeral=True)
