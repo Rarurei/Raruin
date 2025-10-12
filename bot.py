@@ -1,4 +1,4 @@
-# ====== 修正版ブロック（ここをそのまま置き換えてください） ======
+# ====== 修正版ブロック（これを該当箇所と置き換えてください） ======
 
 import os
 import sqlite3
@@ -15,26 +15,20 @@ import requests
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
+# 永続 DB のパス（Render の Persistent Disk を /data にマウントする想定）
+DB_PATH = os.getenv("DB_PATH", "/data/main.db")
+
 # 管理者（OWNER）のDiscord ID（必要に応じて変更）
-OWNER_ID = 1402613707527426131
+OWNER_ID = int(os.getenv("OWNER_ID", "1402613707527426131"))
 
 # --- データベースバックアップ復元元（Discord上のURLなど） ---
-BACKUP_DB_URL = "https://cdn.discordapp.com/attachments/123456789012345678/987654321098765432/main.db"
+BACKUP_DB_URL = os.getenv(
+    "BACKUP_DB_URL",
+    "https://cdn.discordapp.com/attachments/123456789012345678/987654321098765432/main.db"
+)
 
-# 起動時に main.db がなければ外部から復元（任意）
-if not os.path.exists("main.db"):
-    try:
-        print("⚠️ main.db が見つかりません。Discordバックアップから復元を試みます…")
-        r = requests.get(BACKUP_DB_URL, timeout=15)
-        r.raise_for_status()
-        with open("main.db", "wb") as f:
-            f.write(r.content)
-        print("✅ main.db を Discord バックアップから復元しました。")
-    except Exception as e:
-        print(f"❌ main.db の復元に失敗しました: {e}")
-
-# --- バックアップ用チャンネルID（メッセージ送信先） ---
-BACKUP_CHANNEL_ID = 1426803407360098365  # 自分のバックアップ用チャンネルIDに変更
+# バックアップ送信先チャンネルID（int）
+BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "1426803407360098365"))
 
 # ---------- Discord Bot 初期化 ----------
 intents = discord.Intents.default()
@@ -42,18 +36,37 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 tree = bot.tree
 
-# --- 定期バックアップタスク（定義のみ。開始は on_ready() か main() 内で行う） ---
+# ----- 起動時: DB の格納ディレクトリがなければ作る -----
+db_dir = os.path.dirname(DB_PATH) or "/"
+try:
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+except Exception as e:
+    print(f"⚠️ DB ディレクトリ作成に失敗: {e}")
+
+# ----- 起動時: DB がなければ外部から復元を試みる -----
+if not os.path.exists(DB_PATH):
+    try:
+        print(f"⚠️ DB({DB_PATH}) が見つかりません。バックアップURLから復元を試みます…")
+        r = requests.get(BACKUP_DB_URL, timeout=15)
+        r.raise_for_status()
+        with open(DB_PATH, "wb") as f:
+            f.write(r.content)
+        print(f"✅ DB を復元しました: {DB_PATH}")
+    except Exception as e:
+        print(f"❌ DB の復元に失敗しました: {e}  — 続行します（新規 DB を作成します）")
+
+# --- 定期バックアップタスク（定義のみ。開始は on_ready() で行う） ---
 @tasks.loop(hours=24)
 async def backup_database():
     try:
         channel = bot.get_channel(BACKUP_CHANNEL_ID)
         if channel:
-            # main.db が存在することを確認してから送る
-            if os.path.exists("main.db"):
-                await channel.send(file=discord.File("main.db"))
-                print("✅ main.db をバックアップチャンネルに送信しました。")
+            if os.path.exists(DB_PATH):
+                await channel.send(file=discord.File(DB_PATH))
+                print("✅ DB をバックアップチャンネルに送信しました。")
             else:
-                print("⚠️ バックアップ: main.db が見つかりません。送信をスキップします。")
+                print("⚠️ バックアップ: DB ファイルが見つかりません。送信をスキップします。")
         else:
             print("⚠️ バックアップ: 指定されたチャンネルが見つかりません。")
     except Exception as e:
@@ -64,19 +77,19 @@ async def before_backup():
     # bot が準備できるまで待機（安全策）
     await bot.wait_until_ready()
 
-# 重要: ここでは start() を呼ばない（イベントループが未起動だと例外になる）
-# backup_database.start()  # <- 絶対にここで呼ばないこと
+# 重要: モジュール読み込み時に start() は呼ばない（イベントループが無いと例外になる）
+# backup_database.start()  # <- 呼ばないこと
 
 # --- SQLite メイン接続（グローバルに一つだけ作る） ---
-# 他の関数が独自に接続することもあるため互換性を保ちつつ、
-# check_same_thread=False と WAL モードにしておくと実運用で扱いやすくなります。
+# check_same_thread=False は異なるスレッドからの使用を許可しますが、共有接続の運用は注意が必要です。
 try:
-    conn = sqlite3.connect("main.db", timeout=30, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys = ON;")
     c = conn.cursor()
-    print("✅ main.db に接続しました。")
+    print(f"✅ DB に接続しました: {DB_PATH}")
 except Exception as e:
-    print(f"[DB] main.db 接続時にエラーが発生しました: {e}")
+    print(f"[DB] 接続時にエラーが発生しました ({DB_PATH}): {e}")
     conn = None
     c = None
 
@@ -132,7 +145,7 @@ if c:
     )
     ''')
 
-    # purchase_history（必要なら）
+    # purchase_history
     c.execute('''
     CREATE TABLE IF NOT EXISTS purchase_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -144,17 +157,18 @@ if c:
     )
     ''')
 
-    conn.commit()
-
     # 初期データ（ギャンブル設定、管理者登録など）
     c.execute("INSERT OR IGNORE INTO gamble_settings (id, probability_level) VALUES (1, 3)")
-    c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (OWNER_ID,))
+    try:
+        c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (OWNER_ID,))
+    except Exception:
+        pass
+
     conn.commit()
 else:
     print("⚠️ DBカーソルが利用できません。テーブル作成をスキップしました。")
 
-# ===== Discord Bot 設定（既に bot 作成済み） =====
-# tree = bot.tree  # 既に定義済み
+# ===== Discord Bot 設定（bot, tree は既に定義済み） =====
 
 # ===== Flask keep_alive =====
 app = Flask(__name__)
@@ -165,13 +179,36 @@ def home():
 
 def run_flask():
     print("🌐 Flaskサーバー起動: ポート8080で待機中…")
-    app.run(host='0.0.0.0', port=8080)
+    try:
+        app.run(host='0.0.0.0', port=8080)
+    except Exception as e:
+        print(f"Flask 起動エラー: {e}")
 
 # デーモンスレッドで起動（プロセス終了時に自動終了）
 Thread(target=run_flask, daemon=True).start()
 
-# ====== 修正版ブロック 終了 ======
+# ---------- on_ready でタスクを安全に開始 ----------
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"Guilds: {[g.name for g in bot.guilds]}")
+    # コマンド同期（必要なら）
+    try:
+        await tree.sync()
+    except Exception as e:
+        print(f"[on_ready] tree.sync error: {e}")
 
+    # backup_database はここで安全に開始する（重複起動を防ぐ）
+    try:
+        if not backup_database.is_running():
+            backup_database.start()
+            print("backup_database task started.")
+    except Exception as e:
+        print(f"[on_ready] backup_database start error: {e}")
+
+    print("Background tasks started.")
+
+# ====== 修正版ブロック 終了 ======
 
 # ---------- Part 2: 管理者コマンドと通貨操作 ----------
 
@@ -1514,4 +1551,3 @@ async def main():
 # 実行
 if __name__ == "__main__":
     asyncio.run(main())
-
