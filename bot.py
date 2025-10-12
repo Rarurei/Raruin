@@ -25,7 +25,7 @@ import os
 import requests
 
 # Discord上に置いてある最新のmain.dbのURL
-BACKUP_DB_URL = "https://cdn.discordapp.com/attachments/xxxxxx/main.db"
+BACKUP_DB_URL = "https://cdn.discordapp.com/attachments/123456789012345678/987654321098765432/main.db"
 
 if not os.path.exists("main.db"):
     print("⚠️ main.dbが見つかりません。Discordから復元します。")
