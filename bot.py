@@ -3,16 +3,20 @@
 import os
 import sqlite3
 import discord
-from discord.ext import tasks
+from discord.ext import commands, tasks
+from discord import app_commands
 from dotenv import load_dotenv
+from flask import Flask
+from threading import Thread
+import asyncio
 import requests
 
 # 環境変数読み込み（1回で十分）
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# 管理者（OWNER）のDiscord ID
-OWNER_ID = 1402613707527426131  # 必要に応じて書き換えてください
+# 管理者（OWNER）のDiscord ID（必要に応じて変更）
+OWNER_ID = 1402613707527426131
 
 # --- データベースバックアップ復元元（Discord上のURLなど） ---
 BACKUP_DB_URL = "https://cdn.discordapp.com/attachments/123456789012345678/987654321098765432/main.db"
@@ -31,6 +35,12 @@ if not os.path.exists("main.db"):
 
 # --- バックアップ用チャンネルID（メッセージ送信先） ---
 BACKUP_CHANNEL_ID = 1426803407360098365  # 自分のバックアップ用チャンネルIDに変更
+
+# ---------- Discord Bot 初期化 ----------
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="/", intents=intents)
+tree = bot.tree
 
 # --- 定期バックアップタスク（定義のみ。開始は on_ready() か main() 内で行う） ---
 @tasks.loop(hours=24)
@@ -54,133 +64,97 @@ async def before_backup():
     # bot が準備できるまで待機（安全策）
     await bot.wait_until_ready()
 
-# 重要: 以下の行は**削除**またはコメントアウトしてください（イベントループ前に start() すると例外が出ます）
-# backup_database.start()
+# 重要: ここでは start() を呼ばない（イベントループが未起動だと例外になる）
+# backup_database.start()  # <- 絶対にここで呼ばないこと
 
-# --- SQLite メイン接続（グローバルに一つだけ作る場合の設定） ---
-# 既存のコードは都度接続する実装も混在しているため、互換性重視で
-# check_same_thread=False を付け、WAL モードに切り替えておくと同時アクセスにやや寛容になります。
+# --- SQLite メイン接続（グローバルに一つだけ作る） ---
+# 他の関数が独自に接続することもあるため互換性を保ちつつ、
+# check_same_thread=False と WAL モードにしておくと実運用で扱いやすくなります。
 try:
     conn = sqlite3.connect("main.db", timeout=30, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     c = conn.cursor()
+    print("✅ main.db に接続しました。")
 except Exception as e:
     print(f"[DB] main.db 接続時にエラーが発生しました: {e}")
-    # フォールバック: 別ファイルで接続を試みる（必要なら）
     conn = None
     c = None
 
-# ====== 修正版ブロック 終了 ======
-
 # ---------- 必要なテーブルを自動作成 ----------
-c.execute('''
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    balance INTEGER DEFAULT 0,
-    total_received INTEGER DEFAULT 0,
-    total_spent INTEGER DEFAULT 0
-)
-''')
+if c:
+    # users（基本）
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        balance INTEGER DEFAULT 0,
+        total_received INTEGER DEFAULT 0,
+        total_spent INTEGER DEFAULT 0,
+        daily_streak INTEGER DEFAULT 0,
+        last_daily TEXT
+    )
+    ''')
 
-c.execute('''
-CREATE TABLE IF NOT EXISTS admins (
-    user_id INTEGER PRIMARY KEY
-)
-''')
-conn.commit()
+    # admins
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS admins (
+        user_id INTEGER PRIMARY KEY
+    )
+    ''')
 
+    # shops
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS shops (
+        shop_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE
+    )
+    ''')
 
-c.execute('''
-CREATE TABLE IF NOT EXISTS shops (
-    shop_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE
-)
-''')
+    # shop_items
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS shop_items (
+        item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        shop_id INTEGER,
+        name TEXT,
+        description TEXT,
+        price INTEGER,
+        stock TEXT,
+        role_id INTEGER,
+        role_duration INTEGER,
+        FOREIGN KEY (shop_id) REFERENCES shops(shop_id)
+    )
+    ''')
 
-c.execute('''
-CREATE TABLE IF NOT EXISTS shop_items (
-    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    shop_id INTEGER,
-    name TEXT,
-    description TEXT,
-    price INTEGER,
-    stock TEXT,
-    role_id INTEGER,
-    role_duration INTEGER
-)
-''')
+    # gamble_settings
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS gamble_settings (
+        id INTEGER PRIMARY KEY,
+        probability_level INTEGER DEFAULT 3
+    )
+    ''')
 
-c.execute('''
-CREATE TABLE IF NOT EXISTS gamble_settings (
-    id INTEGER PRIMARY KEY,
-    probability_level INTEGER DEFAULT 3
-)
-''')
+    # purchase_history（必要なら）
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS purchase_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        shop_name TEXT,
+        item_name TEXT,
+        price INTEGER,
+        timestamp TEXT
+    )
+    ''')
 
-# --- データベース初期化 ---
-conn = sqlite3.connect("main.db")
-c = conn.cursor()
-
-# --- ユーザーデータ（残高など） ---
-c.execute('''
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    balance INTEGER DEFAULT 0,
-    total_received INTEGER DEFAULT 0,
-    total_spent INTEGER DEFAULT 0,
-    daily_streak INTEGER DEFAULT 0,
-    last_daily TEXT
-)
-''')
-
-# --- ショップ ---
-c.execute('''
-CREATE TABLE IF NOT EXISTS shops (
-    shop_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE
-)
-''')
-
-# --- 商品 ---
-c.execute('''
-CREATE TABLE IF NOT EXISTS shop_items (
-    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    shop_id INTEGER,
-    name TEXT,
-    description TEXT,
-    price INTEGER,
-    stock TEXT,
-    role_id INTEGER,
-    role_duration INTEGER,
-    FOREIGN KEY (shop_id) REFERENCES shops(shop_id)
-)
-''')
-
-conn.commit()
-
-# 初期データ（ギャンブル設定）
-c.execute("INSERT OR IGNORE INTO gamble_settings (id, probability_level) VALUES (1, 3)")
-
-# 管理者を登録
-c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (OWNER_ID,))
-
-conn.commit()
-
-
-# ===== Discord Bot 設定 =====
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="/", intents=intents)
-tree = bot.tree
-
-# ===== ユーティリティ =====
-def is_admin(user_id: int) -> bool:
-    c.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,))
-    return c.fetchone() is not None
-
-def add_user_if_not_exists(user_id: int):
-    c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
     conn.commit()
+
+    # 初期データ（ギャンブル設定、管理者登録など）
+    c.execute("INSERT OR IGNORE INTO gamble_settings (id, probability_level) VALUES (1, 3)")
+    c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (OWNER_ID,))
+    conn.commit()
+else:
+    print("⚠️ DBカーソルが利用できません。テーブル作成をスキップしました。")
+
+# ===== Discord Bot 設定（既に bot 作成済み） =====
+# tree = bot.tree  # 既に定義済み
 
 # ===== Flask keep_alive =====
 app = Flask(__name__)
@@ -193,10 +167,10 @@ def run_flask():
     print("🌐 Flaskサーバー起動: ポート8080で待機中…")
     app.run(host='0.0.0.0', port=8080)
 
-Thread(target=run_flask).start()
+# デーモンスレッドで起動（プロセス終了時に自動終了）
+Thread(target=run_flask, daemon=True).start()
 
-
-
+# ====== 修正版ブロック 終了 ======
 
 
 # ---------- Part 2: 管理者コマンドと通貨操作 ----------
