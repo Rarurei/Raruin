@@ -21,6 +21,19 @@ load_dotenv()
 OWNER_ID = 1402613707527426131  # ここに自分のDiscordユーザーIDを入れる
 load_dotenv()
 
+import os
+import requests
+
+# Discord上に置いてある最新のmain.dbのURL
+BACKUP_DB_URL = "https://cdn.discordapp.com/attachments/xxxxxx/main.db"
+
+if not os.path.exists("main.db"):
+    print("⚠️ main.dbが見つかりません。Discordから復元します。")
+    r = requests.get(BACKUP_DB_URL)
+    with open("main.db", "wb") as f:
+        f.write(r.content)
+    print("✅ main.dbをDiscordバックアップから復元しました。")
+
 # main.py のどこかに追加
 import discord
 from discord.ext import tasks
