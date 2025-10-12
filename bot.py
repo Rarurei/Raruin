@@ -180,7 +180,10 @@ def run_flask():
     print("🌐 Flaskサーバー起動: ポート8080で待機中…")
     try:
         # bind を 0.0.0.0 にして外部からの接続を許可（PaaS によっては不要）
-        app.run(host='0.0.0.0', port=8080)
+       import os
+port = int(os.getenv("PORT", "8080"))
+app.run(host='0.0.0.0', port=port)
+
     except Exception as e:
         print(f"Flask 起動エラー: {e}")
 
