@@ -1,66 +1,76 @@
-# main.py
-# 必要: discord.py==2.4.0, python-dotenv==1.0.1, Flask==3.0.3, aiohttp==3.9.5
+# ====== 修正版ブロック（ここをそのまま置き換えてください） ======
 
 import os
 import sqlite3
 import discord
-from discord.ext import commands, tasks
-from discord import app_commands
+from discord.ext import tasks
 from dotenv import load_dotenv
-from datetime import datetime
-from flask import Flask
-from threading import Thread
-import asyncio
-
-# ===== 環境変数 =====
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-load_dotenv()
-
-# 👇この行を追加（あなたのDiscord IDに変える）
-OWNER_ID = 1402613707527426131  # ここに自分のDiscordユーザーIDを入れる
-load_dotenv()
-
-import os
 import requests
 
-# Discord上に置いてある最新のmain.dbのURL
+# 環境変数読み込み（1回で十分）
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+# 管理者（OWNER）のDiscord ID
+OWNER_ID = 1402613707527426131  # 必要に応じて書き換えてください
+
+# --- データベースバックアップ復元元（Discord上のURLなど） ---
 BACKUP_DB_URL = "https://cdn.discordapp.com/attachments/123456789012345678/987654321098765432/main.db"
 
+# 起動時に main.db がなければ外部から復元（任意）
 if not os.path.exists("main.db"):
-    print("⚠️ main.dbが見つかりません。Discordから復元します。")
-    r = requests.get(BACKUP_DB_URL)
-    with open("main.db", "wb") as f:
-        f.write(r.content)
-    print("✅ main.dbをDiscordバックアップから復元しました。")
+    try:
+        print("⚠️ main.db が見つかりません。Discordバックアップから復元を試みます…")
+        r = requests.get(BACKUP_DB_URL, timeout=15)
+        r.raise_for_status()
+        with open("main.db", "wb") as f:
+            f.write(r.content)
+        print("✅ main.db を Discord バックアップから復元しました。")
+    except Exception as e:
+        print(f"❌ main.db の復元に失敗しました: {e}")
 
-# main.py のどこかに追加
-import discord
-from discord.ext import tasks
+# --- バックアップ用チャンネルID（メッセージ送信先） ---
+BACKUP_CHANNEL_ID = 1426803407360098365  # 自分のバックアップ用チャンネルIDに変更
 
-BACKUP_CHANNEL_ID = 1426803407360098365  # 自分のバックアップ用チャンネルID
-
+# --- 定期バックアップタスク（定義のみ。開始は on_ready() か main() 内で行う） ---
 @tasks.loop(hours=24)
 async def backup_database():
-    channel = bot.get_channel(BACKUP_CHANNEL_ID)
-    if channel:
-        await channel.send(file=discord.File("main.db"))
-        print("✅ main.db をバックアップチャンネルに送信しました。")
+    try:
+        channel = bot.get_channel(BACKUP_CHANNEL_ID)
+        if channel:
+            # main.db が存在することを確認してから送る
+            if os.path.exists("main.db"):
+                await channel.send(file=discord.File("main.db"))
+                print("✅ main.db をバックアップチャンネルに送信しました。")
+            else:
+                print("⚠️ バックアップ: main.db が見つかりません。送信をスキップします。")
+        else:
+            print("⚠️ バックアップ: 指定されたチャンネルが見つかりません。")
+    except Exception as e:
+        print(f"[backup_database] エラー: {e}")
 
 @backup_database.before_loop
 async def before_backup():
+    # bot が準備できるまで待機（安全策）
     await bot.wait_until_ready()
 
-backup_database.start()
+# 重要: 以下の行は**削除**またはコメントアウトしてください（イベントループ前に start() すると例外が出ます）
+# backup_database.start()
 
+# --- SQLite メイン接続（グローバルに一つだけ作る場合の設定） ---
+# 既存のコードは都度接続する実装も混在しているため、互換性重視で
+# check_same_thread=False を付け、WAL モードに切り替えておくと同時アクセスにやや寛容になります。
+try:
+    conn = sqlite3.connect("main.db", timeout=30, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    c = conn.cursor()
+except Exception as e:
+    print(f"[DB] main.db 接続時にエラーが発生しました: {e}")
+    # フォールバック: 別ファイルで接続を試みる（必要なら）
+    conn = None
+    c = None
 
-
-# データベース接続
-conn = sqlite3.connect("database.db")
-c = conn.cursor()
-
-conn = sqlite3.connect("main.db")
-c = conn.cursor()
+# ====== 修正版ブロック 終了 ======
 
 # ---------- 必要なテーブルを自動作成 ----------
 c.execute('''
