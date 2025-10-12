@@ -261,7 +261,7 @@ async def addr(interaction: discord.Interaction, action: str, target: str = None
     else:
         await interaction.response.send_message("⚠️ actionは add, remove, list のいずれかです。", ephemeral=True)
 
-# ---------- ヘルパー: ターゲット解決（@役職名 に堅牢対応） ----------
+## ---------- ヘルパー: ターゲット解決（@役職名 に堅牢対応） ----------
 import re
 from typing import List, Optional
 
@@ -393,7 +393,6 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
 
     # members が空なら、改めて「ロールとして存在するか」をチェックしてユーザ向けメッセージを出す
     if not members:
-        # guild が存在するか確認
         guild = interaction.guild
         if guild:
             role_obj = _find_role_from_input(target, guild)
@@ -409,27 +408,49 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
         await interaction.response.send_message("❌ 対象が見つかりませんでした。@メンション / ID / ロール名 / ユーザー名 を試してください。", ephemeral=True)
         return
 
-    conn = sqlite3.connect("main.db", timeout=10)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            balance INTEGER DEFAULT 0,
-            total_received INTEGER DEFAULT 0,
-            total_spent INTEGER DEFAULT 0
-        )
-    """)
-    for m in members:
-        cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (m.id,))
-        cur.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?", (amount, amount, m.id))
-    conn.commit()
-    conn.close()
+    # 長い処理の可能性があるため defer してからバックグラウンドで DB 更新
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception:
+        # 既にレスポンス済みのとき等はスキップして続行
+        pass
 
+    import sqlite3
+    import asyncio
+
+    def _db_add_balance(member_ids: List[int], amt: int):
+        conn = sqlite3.connect("main.db", timeout=10)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                balance INTEGER DEFAULT 0,
+                total_received INTEGER DEFAULT 0,
+                total_spent INTEGER DEFAULT 0
+            )
+        """)
+        for uid in member_ids:
+            cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
+            cur.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?", (amt, amt, uid))
+        conn.commit()
+        conn.close()
+
+    member_ids = [m.id for m in members]
+
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _db_add_balance, member_ids, amount)
+    except Exception as e:
+        # エラー発生時はフォローアップで通知
+        await interaction.followup.send(f"❌ DB更新中にエラーが発生しました: `{e}`", ephemeral=True)
+        return
+
+    # レスポンス
     if len(members) == 1:
         name = members[0].display_name
     else:
         name = f"{len(members)} 件のメンバー"
-    await interaction.response.send_message(f"🎁 {name} に {amount} Raruin を付与しました。")
+    await interaction.followup.send(f"🎁 {name} に {amount} Raruin を付与しました。")
 
 
 # ---------- /支払い（減算）（修正版：ロール存在チェックとDB安全化含む） ----------
@@ -461,30 +482,47 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
         await interaction.response.send_message("❌ 対象が見つかりませんでした。@メンション / ID / ロール名 / ユーザー名 を試してください。", ephemeral=True)
         return
 
-    # DB処理（安全に）
-    conn = sqlite3.connect("main.db", timeout=10)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            balance INTEGER DEFAULT 0,
-            total_received INTEGER DEFAULT 0,
-            total_spent INTEGER DEFAULT 0
-        )
-    """)
-    for m in members:
-        cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (m.id,))
-        cur.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?", (amount, amount, m.id))
-    conn.commit()
-    conn.close()
+    # defer + DB更新（非ブロッキング）
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception:
+        pass
+
+    import sqlite3
+    import asyncio
+
+    def _db_subtract_balance(member_ids: List[int], amt: int):
+        conn = sqlite3.connect("main.db", timeout=10)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                balance INTEGER DEFAULT 0,
+                total_received INTEGER DEFAULT 0,
+                total_spent INTEGER DEFAULT 0
+            )
+        """)
+        for uid in member_ids:
+            cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
+            cur.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?", (amt, amt, uid))
+        conn.commit()
+        conn.close()
+
+    member_ids = [m.id for m in members]
+
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _db_subtract_balance, member_ids, amount)
+    except Exception as e:
+        await interaction.followup.send(f"❌ DB更新中にエラーが発生しました: `{e}`", ephemeral=True)
+        return
 
     # レスポンス
     if len(members) == 1:
         name = members[0].display_name
     else:
         name = f"{len(members)} 件のメンバー"
-    await interaction.response.send_message(f"💸 {name} から {amount} Raruin を減算しました。")
-
+    await interaction.followup.send(f"💸 {name} から {amount} Raruin を減算しました。")
 
 
 
