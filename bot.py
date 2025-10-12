@@ -21,6 +21,24 @@ load_dotenv()
 OWNER_ID = 1402613707527426131  # ここに自分のDiscordユーザーIDを入れる
 load_dotenv()
 
+# main.py のどこかに追加
+import discord
+from discord.ext import tasks
+
+BACKUP_CHANNEL_ID = 1426803407360098365  # 自分のバックアップ用チャンネルID
+
+@tasks.loop(hours=24)
+async def backup_database():
+    channel = bot.get_channel(BACKUP_CHANNEL_ID)
+    if channel:
+        await channel.send(file=discord.File("main.db"))
+        print("✅ main.db をバックアップチャンネルに送信しました。")
+
+@backup_database.before_loop
+async def before_backup():
+    await bot.wait_until_ready()
+
+backup_database.start()
 
 
 
