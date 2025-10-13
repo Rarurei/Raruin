@@ -6,6 +6,7 @@ from discord import app_commands
 from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
+from github_backup import download_latest_db, upload_db_to_release
 import asyncio
 import requests
 
