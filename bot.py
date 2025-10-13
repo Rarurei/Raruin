@@ -275,7 +275,7 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
         # 完全一致（case-insensitive）
         role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
         if role:
-            return role.members  # 空でも [] を返す（呼び出し側でメッセージ出し分け）
+            return role.members  # 空でも [] を返す
         # 完全一致見つからなければ部分一致（先頭一致 → 含む順）で検索（上位1つのロールを採用）
         starts = [r for r in guild.roles if r.name.lower().startswith(name.lower())]
         if starts:
@@ -351,46 +351,37 @@ def _find_role_from_input(raw: str, guild: discord.Guild) -> Optional[discord.Ro
     return role
 
 
-# ---------- /配布（付与）（修正版：ロール存在チェックとDB安全化含む） ----------
+# ---------- /配布（付与） ----------
 @tree.command(name="配布", description="指定したユーザーやロールにRaruinを付与（管理者専用）")
 @app_commands.describe(target="ユーザー（@で指定可）またはロール名/ID/ユーザー名", amount="付与額")
 async def distribute(interaction: discord.Interaction, target: str, amount: int):
     if not is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
         return
-
     if amount <= 0:
         await interaction.response.send_message("⚠️ 付与額は1以上にしてください。", ephemeral=True)
         return
 
     members = await resolve_target_members(target, interaction)
-
-    # members が空なら、改めて「ロールとして存在するか」をチェックしてユーザ向けメッセージを出す
     if not members:
         guild = interaction.guild
         if guild:
             role_obj = _find_role_from_input(target, guild)
             if role_obj:
-                # ロールは見つかったがメンバー0 のケース
                 if len(role_obj.members) == 0:
                     await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
                     return
-                # ロールにはメンバーがいる（resolve が失敗していた可能性） -> そのメンバーを使う
                 members = role_obj.members
-
     if not members:
         await interaction.response.send_message("❌ 対象が見つかりませんでした。@メンション / ID / ロール名 / ユーザー名 を試してください。", ephemeral=True)
         return
 
-    # 長い処理の可能性があるため defer してからバックグラウンドで DB 更新
     try:
         await interaction.response.defer(ephemeral=True)
     except Exception:
-        # 既にレスポンス済みのとき等はスキップして続行
         pass
 
-    import sqlite3
-    import asyncio
+    import sqlite3, asyncio
 
     def _db_add_balance(member_ids: List[int], amt: int):
         conn = sqlite3.connect("main.db", timeout=10)
@@ -410,16 +401,13 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
         conn.close()
 
     member_ids = [m.id for m in members]
-
     try:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _db_add_balance, member_ids, amount)
     except Exception as e:
-        # エラー発生時はフォローアップで通知
         await interaction.followup.send(f"❌ DB更新中にエラーが発生しました: `{e}`", ephemeral=True)
         return
 
-    # レスポンス
     if len(members) == 1:
         name = members[0].display_name
     else:
@@ -427,21 +415,18 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
     await interaction.followup.send(f"🎁 {name} に {amount} Raruin を付与しました。")
 
 
-# ---------- /支払い（減算）（修正版：ロール存在チェックとDB安全化含む） ----------
+# ---------- /支払い（減算） ----------
 @tree.command(name="支払い", description="指定したユーザーやロールのRaruinを減らす（管理者専用）")
 @app_commands.describe(target="ユーザー（@で指定可）またはロール名/ID/ユーザー名", amount="減らす額")
 async def payment(interaction: discord.Interaction, target: str, amount: int):
     if not is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
         return
-
     if amount <= 0:
         await interaction.response.send_message("⚠️ 減算額は1以上にしてください。", ephemeral=True)
         return
 
     members = await resolve_target_members(target, interaction)
-
-    # members が空ならロール存在チェック（改善）
     if not members:
         guild = interaction.guild
         if guild:
@@ -451,19 +436,16 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
                     await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
                     return
                 members = role_obj.members
-
     if not members:
         await interaction.response.send_message("❌ 対象が見つかりませんでした。@メンション / ID / ロール名 / ユーザー名 を試してください。", ephemeral=True)
         return
 
-    # defer + DB更新（非ブロッキング）
     try:
         await interaction.response.defer(ephemeral=True)
     except Exception:
         pass
 
-    import sqlite3
-    import asyncio
+    import sqlite3, asyncio
 
     def _db_subtract_balance(member_ids: List[int], amt: int):
         conn = sqlite3.connect("main.db", timeout=10)
@@ -483,7 +465,6 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
         conn.close()
 
     member_ids = [m.id for m in members]
-
     try:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _db_subtract_balance, member_ids, amount)
@@ -491,13 +472,11 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
         await interaction.followup.send(f"❌ DB更新中にエラーが発生しました: `{e}`", ephemeral=True)
         return
 
-    # レスポンス
     if len(members) == 1:
         name = members[0].display_name
     else:
         name = f"{len(members)} 件のメンバー"
     await interaction.followup.send(f"💸 {name} から {amount} Raruin を減算しました。")
-
 
 
 
