@@ -286,147 +286,231 @@ except Exception as e:
 db = PersistentDB(DB_PATH)
 
 
-# ---------- ヘルパー: ターゲット解決 ----------
+# ---------- ヘルパー: ターゲット解決（@役職名 に堅牢対応） ----------
 import re
-from typing import List
-import discord
+from typing import List, Optional
 
 async def resolve_target_members(target: str, interaction: discord.Interaction) -> List[discord.Member]:
+    """
+    target: ユーザー/ロール指定の文字列（例: '@役職名', '<@123...>', '<@&roleid>', '1234567890', 'ユーザー名'）
+    戻り値: discord.Member のリスト（見つからなければ [] を返す）
+    """
     guild = interaction.guild
     if not guild:
         return []
 
     raw = target.strip()
 
-    # ロールメンション <@&ID>
-    rm = re.match(r'^<@&(\d+)>$', raw)
+    # 1) ロールメンション形式 <@&123>
+    rm = re.match(r'^<@&(?P<id>\d+)>$', raw)
     if rm:
-        role = guild.get_role(int(rm.group(1)))
+        rid = int(rm.group("id"))
+        role = guild.get_role(rid)
         return role.members if role else []
 
-    # ユーザーメンション <@!ID> または <@ID>
+    # 2) ユーザーメンション形式 <@!123> または <@123>
     um = re.match(r'^<@!?(?P<id>\d+)>$', raw)
     if um:
         uid = int(um.group("id"))
-        member = guild.get_member(uid) or await guild.fetch_member(uid)
+        member = guild.get_member(uid)
+        if not member:
+            try:
+                member = await guild.fetch_member(uid)
+            except:
+                member = None
         return [member] if member else []
 
-    # @ロール名
+    # 3) 先頭が @ （全角＠も含む）で @役職名 の場合 -> ロール名で検索（完全一致：大/小文字無視）
     if raw.startswith("@") or raw.startswith("＠"):
-        name = raw.lstrip("@\uFF20").strip()
+        name = raw.lstrip("@\uFF20").strip()  # 半角/全角@を除去
+        # 完全一致（case-insensitive）
         role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
         if role:
-            return role.members
+            return role.members  # 空でも [] を返す（呼び出し側でメッセージ出し分け）
+        # 完全一致見つからなければ部分一致（先頭一致 → 含む順）で検索（上位1つのロールを採用）
         starts = [r for r in guild.roles if r.name.lower().startswith(name.lower())]
         if starts:
             return starts[0].members
         contains = [r for r in guild.roles if name.lower() in r.name.lower()]
         if contains:
             return contains[0].members
-        return []
+        return []  # 見つからない
 
-    # 数字のみ → member または role
+    # 4) 数字のみ -> ID として member または role を探す
     if raw.isdigit():
         uid = int(raw)
-        member = guild.get_member(uid) or await guild.fetch_member(uid)
+        member = guild.get_member(uid)
+        if not member:
+            try:
+                member = await guild.fetch_member(uid)
+            except:
+                member = None
         if member:
             return [member]
         role = guild.get_role(uid)
         if role:
             return role.members
 
-    # 名前/ニックネーム
-    found = [m for m in guild.members if m.name == raw or (m.nick and m.nick == raw)]
+    # 5) ロール名そのもの（プレーン）を大文字小文字無視で完全一致
+    role = discord.utils.find(lambda r: r.name.lower() == raw.lower(), guild.roles)
+    if role:
+        return role.members
+
+    # 6) ユーザー名/ニックネーム/name#discriminator の完全一致
+    found = []
+    for mbr in guild.members:
+        if mbr.name == raw or (mbr.nick and mbr.nick == raw) or f"{mbr.name}#{mbr.discriminator}" == raw:
+            found.append(mbr)
     if found:
         return found[:50]
 
-    partial = [m for m in guild.members if raw.lower() in m.name.lower() or (m.nick and raw.lower() in m.nick.lower())]
+    # 7) 部分一致（ユーザー名/ニックネーム）
+    partial = [mbr for mbr in guild.members if raw.lower() in mbr.name.lower() or (mbr.nick and raw.lower() in mbr.nick.lower())]
     return partial[:50]
 
-# ---------- DB 更新（スレッドセーフ） ----------
-import sqlite3
 
-def _update_balance(member_ids: list[int], amount: int, db_path: str, add: bool = True):
-    try:
-        conn = sqlite3.connect(db_path, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                balance INTEGER DEFAULT 0,
-                total_received INTEGER DEFAULT 0,
-                total_spent INTEGER DEFAULT 0
-            )
-        """)
-        cur.executemany(
-            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
-            [(uid,) for uid in member_ids]
-        )
-        if add:
-            cur.executemany(
-                "UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
-                [(amount, amount, uid) for uid in member_ids]
-            )
-        else:
-            cur.executemany(
-                "UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?",
-                [(amount, amount, uid) for uid in member_ids]
-            )
-        conn.commit()
-    except Exception as e:
-        print(f"[update_balance] エラー: {e}")
-    finally:
-        conn.close()
+# ヘルパー: 入力からロールオブジェクトを探す（resolve_target_members が見つけられなかった場合の補助）
+def _find_role_from_input(raw: str, guild: discord.Guild) -> Optional[discord.Role]:
+    if not guild:
+        return None
+    s = raw.strip()
+    # mention形式
+    m = re.match(r'^<@&(?P<id>\d+)>$', s)
+    if m:
+        return guild.get_role(int(m.group("id")))
+    # idのみ
+    if s.isdigit():
+        r = guild.get_role(int(s))
+        if r:
+            return r
+    # @で始まる名前（半角/全角@許容）
+    name = s.lstrip("@\uFF20").strip()
+    if name:
+        # 完全一致
+        role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
+        if role:
+            return role
+        # 先頭一致 -> 部分一致
+        starts = [r for r in guild.roles if r.name.lower().startswith(name.lower())]
+        if starts:
+            return starts[0]
+        contains = [r for r in guild.roles if name.lower() in r.name.lower()]
+        if contains:
+            return contains[0]
+    # 最終手段: プレーン文字列をロール名として探す（完全一致）
+    role = discord.utils.find(lambda r: r.name.lower() == s.lower(), guild.roles)
+    return role
 
-async def update_balance_async(member_ids: list[int], amount: int, db_path: str, add: bool = True):
-    await asyncio.to_thread(_update_balance, member_ids, amount, db_path, add)
 
-# ---------- /配布 ----------
-@tree.command(name="配布", description="指定ユーザーやロールにRaruinを付与（管理者専用）")
-@app_commands.describe(target="ユーザーまたはロール", amount="付与額")
+# ---------- /配布（付与）（修正版：ロール存在チェックとDB安全化含む） ----------
+@tree.command(name="配布", description="指定したユーザーやロールにRaruinを付与（管理者専用）")
+@app_commands.describe(target="ユーザー（@で指定可）またはロール名/ID/ユーザー名", amount="付与額")
 async def distribute(interaction: discord.Interaction, target: str, amount: int):
-    if not await is_admin(interaction.user.id):
+    if not is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
         return
+
     if amount <= 0:
         await interaction.response.send_message("⚠️ 付与額は1以上にしてください。", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
     members = await resolve_target_members(target, interaction)
+
+    # members が空なら、改めて「ロールとして存在するか」をチェックしてユーザ向けメッセージを出す
     if not members:
-        await interaction.followup.send("❌ 対象が見つかりません。", ephemeral=True)
+        # guild が存在するか確認
+        guild = interaction.guild
+        if guild:
+            role_obj = _find_role_from_input(target, guild)
+            if role_obj:
+                # ロールは見つかったがメンバー0 のケース
+                if len(role_obj.members) == 0:
+                    await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
+                    return
+                # ロールにはメンバーがいる（resolve が失敗していた可能性） -> そのメンバーを使う
+                members = role_obj.members
+
+    if not members:
+        await interaction.response.send_message("❌ 対象が見つかりませんでした。@メンション / ID / ロール名 / ユーザー名 を試してください。", ephemeral=True)
         return
 
-    member_ids = [m.id for m in members]
-    await update_balance_async(member_ids, amount, "main.db", add=True)
+    conn = sqlite3.connect("main.db", timeout=10)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            balance INTEGER DEFAULT 0,
+            total_received INTEGER DEFAULT 0,
+            total_spent INTEGER DEFAULT 0
+        )
+    """)
+    for m in members:
+        cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (m.id,))
+        cur.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?", (amount, amount, m.id))
+    conn.commit()
+    conn.close()
 
-    name = members[0].display_name if len(members) == 1 else f"{len(members)} 人のメンバー"
-    await interaction.followup.send(f"🎁 {name} に **{amount:,} Raruin** を付与しました。")
+    if len(members) == 1:
+        name = members[0].display_name
+    else:
+        name = f"{len(members)} 件のメンバー"
+    await interaction.response.send_message(f"🎁 {name} に {amount} Raruin を付与しました。")
 
-# ---------- /支払い ----------
-@tree.command(name="支払い", description="指定ユーザーやロールのRaruinを減らす（管理者専用）")
-@app_commands.describe(target="ユーザーまたはロール", amount="減らす額")
+
+# ---------- /支払い（減算）（修正版：ロール存在チェックとDB安全化含む） ----------
+@tree.command(name="支払い", description="指定したユーザーやロールのRaruinを減らす（管理者専用）")
+@app_commands.describe(target="ユーザー（@で指定可）またはロール名/ID/ユーザー名", amount="減らす額")
 async def payment(interaction: discord.Interaction, target: str, amount: int):
-    if not await is_admin(interaction.user.id):
+    if not is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
         return
+
     if amount <= 0:
         await interaction.response.send_message("⚠️ 減算額は1以上にしてください。", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
     members = await resolve_target_members(target, interaction)
+
+    # members が空ならロール存在チェック（改善）
     if not members:
-        await interaction.followup.send("❌ 対象が見つかりません。", ephemeral=True)
+        guild = interaction.guild
+        if guild:
+            role_obj = _find_role_from_input(target, guild)
+            if role_obj:
+                if len(role_obj.members) == 0:
+                    await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
+                    return
+                members = role_obj.members
+
+    if not members:
+        await interaction.response.send_message("❌ 対象が見つかりませんでした。@メンション / ID / ロール名 / ユーザー名 を試してください。", ephemeral=True)
         return
 
-    member_ids = [m.id for m in members]
-    await update_balance_async(member_ids, amount, "main.db", add=False)
+    # DB処理（安全に）
+    conn = sqlite3.connect("main.db", timeout=10)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            balance INTEGER DEFAULT 0,
+            total_received INTEGER DEFAULT 0,
+            total_spent INTEGER DEFAULT 0
+        )
+    """)
+    for m in members:
+        cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (m.id,))
+        cur.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?", (amount, amount, m.id))
+    conn.commit()
+    conn.close()
 
-    name = members[0].display_name if len(members) == 1 else f"{len(members)} 人のメンバー"
-    await interaction.followup.send(f"💸 {name} から **{amount:,} Raruin** を減算しました。")
+    # レスポンス
+    if len(members) == 1:
+        name = members[0].display_name
+    else:
+        name = f"{len(members)} 件のメンバー"
+    await interaction.response.send_message(f"💸 {name} から {amount} Raruin を減算しました。")
+
+
 
 # ---------- /ギャンブル確率設定 ----------
 @tree.command(name="ギャンブル確率設定", description="管理者専用: ギャンブル確率レベル変更")
