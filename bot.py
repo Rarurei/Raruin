@@ -8,6 +8,8 @@ from flask import Flask
 from threading import Thread
 from dotenv import load_dotenv
 from datetime import datetime
+from typing import List, Optional
+import re
 
 # --------------------
 # .env読み込みと初期設定
@@ -55,45 +57,37 @@ tree = bot.tree
 # --------------------
 class PersistentDB:
     def __init__(self, db_path: str):
-        # 環境変数が指定されていればそれを使う
         env_db_path = os.getenv("DB_PATH")
         if env_db_path:
             db_path = env_db_path
 
-        # Render の永続ファイルパスが存在するなら優先
         if os.path.exists("/data"):
-            # 指定が相対パスや空だった場合は /data に main.db を置く
             if not db_path or db_path == "main.db":
                 db_path = "/data/main.db"
-            # もしユーザーが相対パスで main.db としている場合も /data に変更しない（上書きしない方針）
         else:
-            # /data が無ければ警告（ローカル環境など）
             if db_path.startswith("/data"):
-                # fallback
                 db_path = "main.db"
-            print("⚠️ /data が存在しないため、コンテナの作業ディレクトリに DB を配置します（再デプロイで消える可能性あり）。")
+            print("⚠️ /data が存在しないため、DB は作業ディレクトリに保存されます。")
 
         self.db_path = db_path
         db_dir = os.path.dirname(os.path.abspath(self.db_path))
         if db_dir and not os.path.exists(db_dir):
             try:
                 os.makedirs(db_dir, exist_ok=True)
-                print(f"✅ DB ディレクトリ作成: {db_dir}")
+                print(f"✅ DBディレクトリ作成: {db_dir}")
             except Exception as e:
-                print(f"⚠️ DB ディレクトリ作成に失敗しました: {db_dir} ({e})")
+                print(f"⚠️ DBディレクトリ作成失敗: {db_dir} ({e})")
 
         self._warn_if_non_persistent_path()
-        # テーブル作成・初期化
         try:
             self._ensure_tables()
         except Exception as e:
-            print(f"❌ DB 初期化エラー: {e}")
+            print(f"❌ DB初期化エラー: {e}")
 
     def _warn_if_non_persistent_path(self):
         path = os.path.abspath(self.db_path)
         if not path.startswith("/data"):
-            print(f"⚠️ 注意: DB_PATH({path}) は永続化されない可能性があります。")
-            print("   → Render の永続ディスクを利用するか GitHub Releases 等でバックアップしてください。")
+            print(f"⚠️ 注意: {path} は永続化されない可能性があります。")
 
     def _connect(self):
         try:
@@ -102,7 +96,7 @@ class PersistentDB:
             conn.execute("PRAGMA foreign_keys = ON;")
             return conn
         except Exception as e:
-            print(f"❌ DB 接続エラー ({self.db_path}): {e}")
+            print(f"❌ DB接続エラー: {e}")
             raise
 
     def _ensure_tables(self):
@@ -173,29 +167,22 @@ class PersistentDB:
         return await loop.run_in_executor(None, func, *args, **kwargs)
 
 # --------------------
-# DB 初期化（DB_PATH は環境変数優先 /data fallback）
+# DB初期化
 # --------------------
-# デフォルトは環境が提供しているもの、なければ /data/main.db（存在しなければ main.db）
-env_db = os.getenv("DB_PATH")
-if env_db:
-    DB_PATH = env_db
-else:
-    DB_PATH = "/data/main.db" if os.path.exists("/data") else "main.db"
-
+DB_PATH = os.getenv("DB_PATH") or ("/data/main.db" if os.path.exists("/data") else "main.db")
 db = PersistentDB(DB_PATH)
 
 # --------------------
-# ユーザー追加・残高操作関数（同期版 + 非同期 wrapper を用意）
+# ユーザー関連関数
 # --------------------
 def add_user_if_not_exists_sync(user_id: int):
-    conn = None
     try:
         conn = db._connect()
         c = conn.cursor()
         c.execute("INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?, 0, 0, 0)", (user_id,))
         conn.commit()
     except Exception as e:
-        print(f"[add_user_if_not_exists_sync] DB error: {e}")
+        print(f"[add_user_if_not_exists_sync] エラー: {e}")
     finally:
         if conn:
             conn.close()
@@ -204,7 +191,6 @@ async def add_user_if_not_exists(user_id: int):
     await asyncio.to_thread(add_user_if_not_exists_sync, user_id)
 
 def get_balance_sync(user_id: int) -> int:
-    conn = None
     try:
         conn = db._connect()
         c = conn.cursor()
@@ -212,7 +198,7 @@ def get_balance_sync(user_id: int) -> int:
         row = c.fetchone()
         return int(row[0]) if row else 0
     except Exception as e:
-        print(f"[get_balance_sync] DB error: {e}")
+        print(f"[get_balance_sync] エラー: {e}")
         return 0
     finally:
         if conn:
@@ -222,21 +208,17 @@ async def get_balance(user_id: int) -> int:
     return await asyncio.to_thread(get_balance_sync, user_id)
 
 def update_balance_sync(user_id: int, amount: int):
-    conn = None
     try:
         conn = db._connect()
         c = conn.cursor()
-        # ensure user exists
         c.execute("INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?, 0, 0, 0)", (user_id,))
-        # update balance and totals
         if amount >= 0:
             c.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?", (amount, amount, user_id))
         else:
-            # amount is negative: reduce balance and add to total_spent
             c.execute("UPDATE users SET balance = balance + ?, total_spent = total_spent + ? WHERE user_id=?", (amount, -amount, user_id))
         conn.commit()
     except Exception as e:
-        print(f"[update_balance_sync] DB error: {e}")
+        print(f"[update_balance_sync] エラー: {e}")
     finally:
         if conn:
             conn.close()
@@ -245,11 +227,10 @@ async def update_balance(user_id: int, amount: int):
     await asyncio.to_thread(update_balance_sync, user_id, amount)
 
 # --------------------
-# イベント: 起動時
+# 起動時イベント
 # --------------------
 @bot.event
 async def on_ready():
-    # 安全な起動ログ表示
     try:
         print("===================================================")
         print("✅ ログイン完了:", bot.user)
@@ -259,35 +240,21 @@ async def on_ready():
         print("Owner ID:", OWNER_ID)
         print("===================================================")
     except Exception:
-        # ここはログ取得失敗でも続行
         pass
 
-    # スラッシュコマンド同期（失敗しても落とさない）
     try:
         await tree.sync()
         print("✅ スラッシュコマンドを同期しました。")
     except Exception as e:
-        print(f"⚠️ スラッシュコマンド同期中にエラー: {e}")
-
-    # ここでバックグラウンドタスク（voice_check など）が定義されていれば起動する
-    # 例:
-    # try:
-    #     if not voice_check.is_running():
-    #         voice_check.start()
-    #         print("✅ voice_check を開始しました。")
-    # except Exception as e:
-    #     print(f"⚠️ voice_check 起動エラー: {e}")
+        print(f"⚠️ スラッシュコマンド同期エラー: {e}")
 
     print("Bot is ready.")
 
-# ---------- Part 2: 管理者コマンドと通貨操作 (PersistentDB対応) ----------
-
-import re
-from typing import List, Optional
-
-# ---------- ユーティリティ: ユーザー追加（同期関数、db.executeで呼ぶ） ----------
+# --------------------
+# ユーティリティ: ユーザー存在確認関数
+# --------------------
 def _add_user_if_not_exists_sync(user_id: int, db_path: str):
-    """sync function for db.execute"""
+    """同期版ユーザー登録関数"""
     conn = sqlite3.connect(db_path, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL;")
     cur = conn.cursor()
@@ -305,9 +272,8 @@ def _add_user_if_not_exists_sync(user_id: int, db_path: str):
     conn.commit()
     conn.close()
 
-# wrapper so existing code can call add_user_if_not_exists synchronously if needed:
 def add_user_if_not_exists(user_id: int):
-    # call via db.execute from async code: await db.execute(_add_user_if_not_exists_sync, user_id, DB_PATH)
+    """上位互換のシンプル版ラッパー"""
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL;")
     cur = conn.cursor()
@@ -324,6 +290,7 @@ def add_user_if_not_exists(user_id: int):
     cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
     conn.commit()
     conn.close()
+
 
 
 # ---------- /addr - 管理者追加・削除・一覧 ----------
@@ -1105,9 +1072,8 @@ async def bot_info(interaction: discord.Interaction):
     await interaction.response.send_message(msg)
 
 
-# ---------- Part 5: ギャンブル・自動付与・起動ログ・keep-alive（修正版） ----------
+# ---------- Part 5: ギャンブル・自動付与・起動ログ・keep-alive (修正版) ----------
 import os
-import discord
 import random
 import time
 import sqlite3
@@ -1116,41 +1082,70 @@ from datetime import datetime
 from discord.ext import tasks
 from discord import app_commands
 from discord.ui import View, Button
+import discord
+
+# ===== keep-alive: safe Flask start (replace existing Flask start block) =====
 from flask import Flask
 from threading import Thread
+import os
 
-# DB path を環境変数から
-DB_PATH = os.getenv("DB_PATH", "main.db")
+PORT = int(os.getenv("PORT", "8080"))  # Renderでは環境変数PORTが与えられることが多い
 
-# ---------- Flask Keep-Alive ----------
-app = Flask("RaruinKeepAlive")
+# guard: start Flask only once even if code imported multiple times
+if not globals().get("_FLASK_KEEPALIVE_STARTED"):
+    app = Flask("RaruinKeepAlive")
 
-@app.route("/")
-def home():
-    return "Raruin Bot is alive!"
+    @app.route("/")
+    def _home():
+        return "Raruin Bot is alive!"
 
-def run_flask():
+    def _run_flask():
+        try:
+            # use env PORT; if port already in use, catch and continue
+            app.run(host="0.0.0.0", port=PORT)
+        except OSError as e:
+            print(f"⚠️ Flask: port {PORT} is unavailable: {e} — keep-alive not started on that port.")
+        except Exception as e:
+            print(f"⚠️ Flask unexpected error: {e}")
+
+    Thread(target=_run_flask, daemon=True).start()
+    globals()["_FLASK_KEEPALIVE_STARTED"] = True
+    print(f"✅ Flask keep-alive attempted on port {PORT}.")
+
+
+# ---------- DB helpers (each operation opens a connection) ----------
+def _ensure_db_dir(path):
+    db_dir = os.path.dirname(path)
+    if db_dir:
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+            print(f"✅ DB ディレクトリ作成: {db_dir}")
+        except Exception as e:
+            print(f"⚠️ DB ディレクトリ作成エラー ({db_dir}): {e}")
+
+# attempt to create dir (if permission denied, we'll fall back later)
+try:
+    _ensure_db_dir(DB_PATH)
+except Exception:
+    pass
+
+def get_conn():
+    # If DB_PATH directory is not writable, fall back to local main.db
+    path = DB_PATH
     try:
-        port = int(os.getenv("PORT", "8080"))
-    except:
-        port = 8080
-    try:
-        app.run(host="0.0.0.0", port=port)
+        conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
     except Exception as e:
-        print(f"[Flask] 起動エラー: {e}")
-
-Thread(target=run_flask, daemon=True).start()
-
-# ---------- DB ユーティリティ（接続は毎回作成／破棄） ----------
-def _connect():
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+        print(f"⚠️ DB open error for {path}: {e} — falling back to main.db")
+        path = "main.db"
+        conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
-def ensure_tables_sync():
-    conn = _connect()
-    cur = conn.cursor()
-    cur.executescript('''
+def init_tables():
+    conn = get_conn()
+    c = conn.cursor()
+    c.executescript("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         balance INTEGER DEFAULT 0,
@@ -1171,197 +1166,195 @@ def ensure_tables_sync():
         price INTEGER,
         timestamp TEXT
     );
-    ''')
-    cur.execute("INSERT OR IGNORE INTO gamble_settings (id, probability_level) VALUES (1, 3)")
+    CREATE TABLE IF NOT EXISTS shops (
+        shop_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE
+    );
+    CREATE TABLE IF NOT EXISTS shop_items (
+        item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        shop_id INTEGER,
+        name TEXT,
+        description TEXT,
+        price INTEGER,
+        stock TEXT,
+        role_id INTEGER,
+        role_duration INTEGER,
+        FOREIGN KEY (shop_id) REFERENCES shops(shop_id)
+    );
+    """)
+    c.execute("INSERT OR IGNORE INTO gamble_settings (id, probability_level) VALUES (1,3)")
+    conn.commit()
+    conn.close()
+    print("✅ DB テーブル確認・作成済み")
+
+# initialize at import time
+init_tables()
+
+# ---------- helper functions ----------
+def add_user_if_not_exists(user_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
     conn.commit()
     conn.close()
 
-# 初回テーブル作成（同期）
-try:
-    ensure_tables_sync()
-except Exception as e:
-    print(f"[DB] テーブル作成エラー: {e}")
-
-# 同期版 DB 操作（スレッド用）
-def add_user_if_not_exists_sync(user_id: int):
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-    conn.commit()
-    conn.close()
-
-def update_balance_sync(user_id: int, amount: int):
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?, 0, 0, 0)", (user_id,))
+def update_balance(user_id: int, amount: int):
+    """amount が正なら受取、負なら支出として記録"""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
     if amount >= 0:
-        cur.execute(
-            "UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
-            (amount, amount, user_id)
-        )
+        c.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
+                  (amount, amount, user_id))
     else:
-        cur.execute(
-            "UPDATE users SET balance = balance + ?, total_spent = total_spent + ? WHERE user_id=?",
-            (amount, -amount, user_id)
-        )
+        c.execute("UPDATE users SET balance = balance + ?, total_spent = total_spent + ? WHERE user_id=?",
+                  (amount, -amount, user_id))
     conn.commit()
     conn.close()
 
-def get_balance_sync(user_id: int) -> int:
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
+def get_balance(user_id: int) -> int:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
     conn.close()
     return row[0] if row else 0
 
-def get_probability_sync() -> int:
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO gamble_settings (id, probability_level) VALUES (1,3)")
+def get_probability() -> int:
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO gamble_settings (id, probability_level) VALUES (1,3)")
+    c.execute("SELECT probability_level FROM gamble_settings WHERE id=1")
+    row = c.fetchone()
     conn.commit()
-    cur.execute("SELECT probability_level FROM gamble_settings WHERE id=1")
-    row = cur.fetchone()
     conn.close()
-    return int(row[0]) if row else 3
+    return row[0] if row else 3
 
-# 非同期ラッパー（コマンドから呼ぶ）
-async def add_user_if_not_exists(user_id: int):
-    await asyncio.to_thread(add_user_if_not_exists_sync, user_id)
-
-async def update_balance(user_id: int, amount: int):
-    await asyncio.to_thread(update_balance_sync, user_id, amount)
-
-async def get_balance(user_id: int) -> int:
-    return await asyncio.to_thread(get_balance_sync, user_id)
-
-async def get_probability() -> int:
-    return await asyncio.to_thread(get_probability_sync)
-
-# ---------- 起動時ログ ----------
+# ---------- startup log ----------
 async def startup_log():
     print("===================================================")
-    print("🚀 Bot起動開始 🚀")
+    print("🚀 Bot 起動開始")
     print("日時:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    print("Flask keep-alive 起動済み")
-    print("SQLite DB path:", DB_PATH)
-    print("各種テーブル確認・作成済み")
-    print("===================================================\n")
+    print(f"DB: {DB_PATH}")
+    print("Flask keep-alive: running (if port was free).")
+    print("テーブル: users, gamble_settings, purchase_history, shops, shop_items")
+    print("===================================================")
     await asyncio.sleep(0.05)
 
-# ---------- 雑談文字数に応じた自動付与 ----------
-def _db_add_chat_earnings_sync(user_id: int, earned: int):
-    update_balance_sync(user_id, earned)
-
-@discord.ext.commands.Cog.listener  # もし Cog の外で使うならこのデコレータは不要。既存コードに合わせてください
-async def _on_message_listener(message):
-    # このファイルをそのまま貼る場合、bot.event を使っている既存箇所に合わせてください
-    pass
-
-# 既存コードで bot.event を使っているなら下の on_message をプロジェクトに残してください:
-@bot.event
-async def on_message(message):
+# ---------- chat earnings (register listener safely) ----------
+async def _on_message_for_earnings(message):
+    # avoid interfering with other on_message handlers: this is registered as an extra listener
     if message.author.bot:
         return
-    if message.content and message.content.strip():
-        earned = len(message.content)
-        try:
-            await asyncio.to_thread(_db_add_chat_earnings_sync, message.author.id, earned)
-        except Exception as e:
-            print(f"[on_message] chat earning error: {e}")
-    await bot.process_commands(message)
+    content = message.content or ""
+    if content.strip():
+        earned = len(content)
+        # run sync DB write in thread so we don't block
+        def _write():
+            add_user_if_not_exists(message.author.id)
+            conn = get_conn()
+            c = conn.cursor()
+            c.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
+                      (earned, earned, message.author.id))
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(_write)
 
-# ---------- 通話参加で1分ごとに12Raruin ----------
+# register the listener only if bot exists (avoid NameError when loading standalone)
+if "bot" in globals():
+    try:
+        bot.add_listener(_on_message_for_earnings, "on_message")
+        print("✅ on_message earnings listener registered")
+    except Exception as e:
+        print(f"⚠️ failed to add on_message listener: {e}")
+
+# ---------- voice_check (1 minute loop) ----------
 @tasks.loop(minutes=1)
 async def voice_check():
+    if "bot" not in globals():
+        return
     for guild in bot.guilds:
         for vc in guild.voice_channels:
             for member in vc.members:
                 if member.bot:
                     continue
-                try:
-                    await update_balance(member.id, 12)
-                except Exception as e:
-                    print(f"[voice_check] update error for {member.id}: {e}")
+                # use update_balance (thread-safe per-call)
+                update_balance(member.id, 12)
 
-# ---------- 汎用ギャンブル勝敗判定 ----------
+# ---------- 汎用勝敗判定 ----------
 last_win_times = {}
 
-def is_win_sync(user_id: int, base_chance: int = 0) -> bool:
+def is_win(user_id: int, base_chance: int = 0) -> bool:
     now = time.time()
     if user_id in last_win_times and now - last_win_times[user_id] < 60:
         return False
-    prob_level = get_probability_sync()
-    chance_table = {1: 20, 2: 15, 3: 10, 4: 5, 5: 2, 6: 1}
-    chance = min(chance_table.get(prob_level, 10) + base_chance, 100)
-    win = random.randint(1, 100) <= chance
+    prob = get_probability()
+    chance_table = {1:20,2:15,3:10,4:5,5:2,6:1}
+    chance = min(chance_table.get(prob, 10) + base_chance, 100)
+    win = random.randint(1,100) <= chance
     if win:
         last_win_times[user_id] = now
     return win
-
-async def is_win(user_id: int, base_chance: int = 0) -> bool:
-    return await asyncio.to_thread(is_win_sync, user_id, base_chance)
 
 # ---------- スロット ----------
 @tree.command(name="スロット", description="スロットで遊ぶ")
 @app_commands.describe(bet="ベット額")
 async def slot(interaction: discord.Interaction, bet: int):
     user_id = interaction.user.id
-    balance = await get_balance(user_id)
+    add_user_if_not_exists(user_id)
+    balance = get_balance(user_id)
     if bet <= 0 or balance < bet:
         await interaction.response.send_message(f"💰 残高不足です。あなたの残高: {balance}", ephemeral=True)
         return
 
-    prob_level = await get_probability()
+    prob_level = get_probability()
     symbol_table = {
-        1: ["🍒","🍋","🍇","⭐","💎"],
-        2: ["🍒","🍋","🍇","⭐","💎","🍉","🔔"],
-        3: ["🍒","🍋","🍇","⭐","💎","🍉","🔔","🍀","🥝","🍊"],
-        4: ["🍒","🍋","🍇","⭐","💎","🍉","🔔","🍀","🥝","🍊","🎱","💰","🪙"],
-        5: ["🍒","🍋","🍇","⭐","💎","🍉","🔔","🍀","🥝","🍊","🎱","💰","🪙","🍎","🍆"],
-        6: ["🍒","🍋","🍇","⭐","💎","🍉","🔔","🍀","🥝","🍊","🎱","💰","🪙","🍎","🍆","🍌","🥭","🍍","🥥","🥕"]
+        1:["🍒","🍋","🍇","⭐","💎"],
+        2:["🍒","🍋","🍇","⭐","💎","🍉","🔔"],
+        3:["🍒","🍋","🍇","⭐","💎","🍉","🔔","🍀","🥝","🍊"],
+        4:["🍒","🍋","🍇","⭐","💎","🍉","🔔","🍀","🥝","🍊","🎱","💰","🪙"],
+        5:["🍒","🍋","🍇","⭐","💎","🍉","🔔","🍀","🥝","🍊","🎱","💰","🪙","🍎","🍆"],
+        6:["🍒","🍋","🍇","⭐","💎","🍉","🔔","🍀","🥝","🍊","🎱","💰","🪙","🍎","🍆","🍌","🥭","🍍","🥥","🥕"]
     }
     symbols = symbol_table.get(prob_level, symbol_table[3])
     reels = [random.choice(symbols) for _ in range(3)]
 
     if reels[0] == reels[1] == reels[2]:
         payout = bet * 5
-        await update_balance(user_id, payout)
+        update_balance(user_id, payout)
         msg = f"🎉 大当たり! +{payout} Raruin"
     elif len(set(reels)) == 2:
         payout = bet * 2
-        await update_balance(user_id, payout)
+        update_balance(user_id, payout)
         msg = f"✨ 中当たり! +{payout} Raruin"
     else:
         payout = -bet
-        await update_balance(user_id, payout)
+        update_balance(user_id, payout)
         msg = f"💀 ハズレ... -{bet} Raruin"
 
-    new_bal = await get_balance(user_id)
-    await interaction.response.send_message(f"🎰 {' | '.join(reels)}\n{msg}\n残高: {new_bal} Raruin")
+    await interaction.response.send_message(f"🎰 {' | '.join(reels)}\n{msg}\n残高: {get_balance(user_id)} Raruin")
 
 # ---------- コイントス ----------
 @tree.command(name="コイントス", description="コイントスで勝負")
 @app_commands.describe(bet="掛け金")
 async def coin(interaction: discord.Interaction, bet: int):
     user_id = interaction.user.id
-    balance = await get_balance(user_id)
-    if bet <= 0 or balance < bet:
+    add_user_if_not_exists(user_id)
+    if bet <= 0 or get_balance(user_id) < bet:
         await interaction.response.send_message("💰 残高不足です。", ephemeral=True)
         return
 
     win = random.choice([True, False])
     if win:
         payout = bet * 2
-        await update_balance(user_id, payout)
+        update_balance(user_id, payout)
         msg = f"🎉 {payout} Raruin 獲得"
     else:
         payout = -bet
-        await update_balance(user_id, payout)
+        update_balance(user_id, payout)
         msg = f"💀 {bet} Raruin 減少"
 
-    new_bal = await get_balance(user_id)
-    await interaction.response.send_message(f"コイントス: {'表' if win else '裏'}\n{msg}\n残高: {new_bal} Raruin")
+    await interaction.response.send_message(f"コイントス: {'表' if win else '裏'}\n{msg}\n残高: {get_balance(user_id)} Raruin")
 
 # ---------- ハイアンドロー ----------
 class HiLoView(View):
@@ -1369,127 +1362,104 @@ class HiLoView(View):
         super().__init__(timeout=30)
         self.user_id = user_id
         self.current_card = current_card
-        self.next_card = random.randint(1, 13)
+        self.next_card = random.randint(1,13)
         self.bet = bet
 
-    async def finish(self, interaction, win):
+    async def finish(self, interaction: discord.Interaction, win: bool):
         if win:
             payout = int(self.bet * 0.3)
             msg = f"🎉 勝ち! +{payout} Raruin"
         else:
             payout = -self.bet
             msg = f"💀 負け... -{self.bet} Raruin"
-        await update_balance(self.user_id, payout)
-        new_bal = await get_balance(self.user_id)
-        await interaction.response.edit_message(
-            content=f"{self.current_card} → {self.next_card}\n{msg}\n残高: {new_bal} Raruin",
-            view=None
-        )
+        update_balance(self.user_id, payout)
+        await interaction.response.edit_message(content=f"{self.current_card} → {self.next_card}\n{msg}\n残高: {get_balance(self.user_id)} Raruin", view=None)
 
     @discord.ui.button(label="ハイ", style=discord.ButtonStyle.primary)
     async def hi_button(self, interaction: discord.Interaction, button: Button):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("❌ あなた専用です", ephemeral=True)
             return
-        win = self.next_card > self.current_card
-        await self.finish(interaction, win)
+        await self.finish(interaction, self.next_card > self.current_card)
 
     @discord.ui.button(label="ロー", style=discord.ButtonStyle.secondary)
     async def low_button(self, interaction: discord.Interaction, button: Button):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("❌ あなた専用です", ephemeral=True)
             return
-        win = self.next_card < self.current_card
-        await self.finish(interaction, win)
+        await self.finish(interaction, self.next_card < self.current_card)
 
 @tree.command(name="ハイアンドロー", description="ハイアンドローで勝負")
 @app_commands.describe(bet="掛け金")
 async def hilo(interaction: discord.Interaction, bet: int):
     user_id = interaction.user.id
-    balance = await get_balance(user_id)
-    if bet <= 0 or balance < bet:
+    add_user_if_not_exists(user_id)
+    if bet <= 0 or get_balance(user_id) < bet:
         await interaction.response.send_message("💰 残高不足です。", ephemeral=True)
         return
-    view = HiLoView(user_id, random.randint(1, 13), bet)
-    await interaction.response.send_message(
-        f"現在のカード: {view.current_card}\nハイかローを選んでください。",
-        view=view,
-        ephemeral=True
-    )
+    view = HiLoView(user_id, random.randint(1,13), bet)
+    await interaction.response.send_message(f"現在のカード: {view.current_card}\nハイかローを選んでください。", view=view, ephemeral=True)
 
 # ---------- ルーレット ----------
 @tree.command(name="ルーレット", description="ルーレットで勝負")
 @app_commands.describe(bet="掛け金", choice="赤/黒/偶数/奇数/番号(0-36)")
 async def roulette(interaction: discord.Interaction, bet: int, choice: str):
     user_id = interaction.user.id
-    balance = await get_balance(user_id)
-    if bet <= 0 or balance < bet:
+    add_user_if_not_exists(user_id)
+    if bet <= 0 or get_balance(user_id) < bet:
         await interaction.response.send_message("💰 残高不足です。", ephemeral=True)
         return
 
-    choice_str = choice.strip()
-    number = random.randint(0, 36)
+    choice_str = (choice or "").strip()
+    number = random.randint(0,36)
     color = "赤" if number % 2 == 0 else "黒"
-
-    win = False
-    payout = 0
+    win=False; payout=0
 
     if choice_str.isdigit():
         chosen_num = int(choice_str)
         if 0 <= chosen_num <= 36 and chosen_num == number:
-            win = True
-            payout = bet * 35
-    if not win and choice_str in ["赤", "黒"]:
+            win=True; payout=bet*35
+    if not win and choice_str in ("赤","黒"):
         if choice_str == color:
-            win = True
-            payout = bet * 2
-    if not win and choice_str in ["偶数", "奇数"]:
-        if (number % 2 == 0 and choice_str == "偶数") or (number % 2 == 1 and choice_str == "奇数"):
-            win = True
-            payout = bet * 2
+            win=True; payout=bet*2
+    if not win and choice_str in ("偶数","奇数"):
+        if (number % 2 == 0 and choice_str=="偶数") or (number % 2 == 1 and choice_str=="奇数"):
+            win=True; payout=bet*2
 
     if win:
-        await update_balance(user_id, payout)
-        msg = f"🎉 勝ち! {payout} Raruin 獲得"
+        update_balance(user_id, payout)
+        msg=f"🎉 勝ち! {payout} Raruin 獲得"
     else:
-        await update_balance(user_id, -bet)
-        msg = f"💀 負け... -{bet} Raruin"
+        update_balance(user_id, -bet)
+        msg=f"💀 負け... -{bet} Raruin"
 
-    new_bal = await get_balance(user_id)
-    await interaction.response.send_message(f"ルーレット: 出目 {number} ({color})\n{msg}\n残高: {new_bal} Raruin")
+    await interaction.response.send_message(f"ルーレット: 出目 {number} ({color})\n{msg}\n残高: {get_balance(user_id)} Raruin")
 
 # ---------- ポーカー ----------
 def hand_rank_by_counts(rank_list):
-    order = {r: i for i, r in enumerate(['2','3','4','5','6','7','8','9','10','J','Q','K','A'], start=2)}
-    counts = {}
+    order = {r:i for i,r in enumerate(['2','3','4','5','6','7','8','9','10','J','Q','K','A'], start=2)}
+    counts={}
     for r in rank_list:
-        counts[r] = counts.get(r, 0) + 1
-    items = sorted([(cnt, order[r], r) for r, cnt in counts.items()], key=lambda x: (-x[0], -x[1]))
+        counts[r]=counts.get(r,0)+1
+    items = sorted([(cnt, order[r], r) for r,cnt in counts.items()], key=lambda x:(-x[0], -x[1]))
     cnts = sorted(counts.values(), reverse=True)
-    if cnts[0] == 4:
-        category = 6
-    elif cnts[0] == 3 and len(cnts) > 1 and cnts[1] == 2:
-        category = 5
-    elif cnts[0] == 3:
-        category = 4
-    elif cnts[0] == 2 and len(cnts) > 1 and cnts[1] == 2:
-        category = 3
-    elif cnts[0] == 2:
-        category = 2
-    else:
-        category = 1
-    tiebreaker = []
+    if cnts[0]==4: category=6
+    elif cnts[0]==3 and len(cnts)>1 and cnts[1]==2: category=5
+    elif cnts[0]==3: category=4
+    elif cnts[0]==2 and len(cnts)>1 and cnts[1]==2: category=3
+    elif cnts[0]==2: category=2
+    else: category=1
+    tiebreaker=[]
     for cnt, rv, r in items:
-        tiebreaker.append(cnt)
-        tiebreaker.append(rv)
+        tiebreaker.append(cnt); tiebreaker.append(rv)
     return (category, tiebreaker)
 
 @tree.command(name="ポーカー", description="5枚カードで勝負（対ディーラー）")
 @app_commands.describe(bet="掛け金")
 async def poker(interaction: discord.Interaction, bet: int):
     user_id = interaction.user.id
-    balance = await get_balance(user_id)
-    if bet <= 0 or balance < bet:
+    add_user_if_not_exists(user_id)
+    if bet <= 0 or get_balance(user_id) < bet:
         await interaction.response.send_message("💰 残高不足です。", ephemeral=True)
         return
 
@@ -1497,61 +1467,47 @@ async def poker(interaction: discord.Interaction, bet: int):
     suits = ["♠","♥","♦","♣"]
     deck = [r+s for r in ranks for s in suits]
     cards = random.sample(deck, 10)
-    player_cards = cards[:5]
-    dealer_cards = cards[5:]
-    player_ranks = [c[:-1] for c in player_cards]
-    dealer_ranks = [c[:-1] for c in dealer_cards]
+    player_cards = cards[:5]; dealer_cards = cards[5:]
+    player_ranks = [c[:-1] for c in player_cards]; dealer_ranks = [c[:-1] for c in dealer_cards]
+    player_rank = hand_rank_by_counts(player_ranks); dealer_rank = hand_rank_by_counts(dealer_ranks)
 
-    player_rank = hand_rank_by_counts(player_ranks)
-    dealer_rank = hand_rank_by_counts(dealer_ranks)
-
-    prob_level = await get_probability()
+    prob_level = get_probability()
     dealer_modifier = prob_level - 3
     modified_dealer_category = max(1, min(6, dealer_rank[0] + dealer_modifier))
     modified_dealer_rank = (modified_dealer_category, dealer_rank[1])
 
-    if player_rank[0] > modified_dealer_rank[0]:
-        winner = "player"
-    elif player_rank[0] < modified_dealer_rank[0]:
-        winner = "dealer"
+    if player_rank[0] > modified_dealer_rank[0]: winner="player"
+    elif player_rank[0] < modified_dealer_rank[0]: winner="dealer"
     else:
-        if player_rank[1] > modified_dealer_rank[1]:
-            winner = "player"
-        elif player_rank[1] < modified_dealer_rank[1]:
-            winner = "dealer"
-        else:
-            winner = "tie"
+        if player_rank[1] > modified_dealer_rank[1]: winner="player"
+        elif player_rank[1] < modified_dealer_rank[1]: winner="dealer"
+        else: winner="tie"
 
-    mult_map = {6:10,5:7,4:3,3:2,2:1.5,1:0}
+    mult_map={6:10,5:7,4:3,3:2,2:1.5,1:0}
     mult = mult_map.get(player_rank[0], 0)
 
-    if winner == "player" and mult > 0:
-        payout = int(bet * mult)
-        await update_balance(user_id, payout)
-        msg = f"🎉 あなたの勝ち! ({payout} Raruin 獲得)"
-    elif winner == "player" and mult == 0:
-        payout = bet
-        await update_balance(user_id, payout)
-        msg = f"🎉 あなたの勝ち! ハイカードで勝利: +{payout} Raruin"
-    elif winner == "tie":
-        msg = "🤝 引き分けです。ベットは返却されます。"
+    if winner=="player" and mult>0:
+        payout=int(bet*mult); update_balance(user_id, payout); msg=f"🎉 あなたの勝ち! ({payout} Raruin 獲得)"
+    elif winner=="player" and mult==0:
+        payout=bet; update_balance(user_id, payout); msg=f"🎉 あなたの勝ち! ハイカードで勝利: +{payout} Raruin"
+    elif winner=="tie":
+        msg="🤝 引き分けです。ベットは返却されます。"
     else:
-        payout = -bet
-        await update_balance(user_id, payout)
-        msg = f"💀 あなたの負け... -{bet} Raruin"
+        payout=-bet; update_balance(user_id, payout); msg=f"💀 あなたの負け... -{bet} Raruin"
 
-    category_names = {6:"フォーカード",5:"フルハウス",4:"スリーカード",3:"ツーペア",2:"ワンペア",1:"ハイカード"}
-    player_cat_name = category_names.get(player_rank[0], "不明")
-    dealer_cat_name = category_names.get(dealer_rank[0], "不明")
-    modified_dealer_cat_name = category_names.get(modified_dealer_category, "不明")
+    category_names={6:"フォーカード",5:"フルハウス",4:"スリーカード",3:"ツーペア",2:"ワンペア",1:"ハイカード"}
+    player_cat_name=category_names.get(player_rank[0],"不明")
+    dealer_cat_name=category_names.get(dealer_rank[0],"不明")
+    modified_dealer_cat_name=category_names.get(modified_dealer_category,"不明")
 
-    new_bal = await get_balance(user_id)
     await interaction.response.send_message(
         f"あなたの手札: {' '.join(player_cards)} ({player_cat_name})\n"
         f"ディーラーの手札: {' '.join(dealer_cards)} ({dealer_cat_name})\n"
         f"→ ディーラー強さ調整: {modified_dealer_cat_name}\n\n"
-        f"{msg}\n残高: {new_bal} Raruin"
+        f"{msg}\n残高: {get_balance(user_id)} Raruin"
     )
+# ---------------------------------------------------------------------------
+
 
 # ---------- Bot Ready hook（既存 bot, tree を想定） ----------
 @bot.event
