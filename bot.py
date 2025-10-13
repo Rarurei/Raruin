@@ -417,11 +417,101 @@ async def on_ready():
         print(f"[on_ready] auto_backup_task start error: {e}")
     print("Bot is ready.")
 
-# --------------------
-# /配布
-# --------------------
-@tree.command(name="配布", description="指定したユーザーまたはロールにRaruinを付与（管理者専用）")
-@app_commands.describe(target="ユーザーまたはロール", amount="付与する金額")
+# ---------- ヘルパー: ターゲット解決 ----------
+import re
+from typing import List, Optional
+
+async def resolve_target_members(target: str, interaction: discord.Interaction) -> List[discord.Member]:
+    guild = interaction.guild
+    if not guild:
+        return []
+
+    raw = target.strip()
+
+    # ロールメンション <@&ID>
+    rm = re.match(r'^<@&(\d+)>$', raw)
+    if rm:
+        role = guild.get_role(int(rm.group(1)))
+        return role.members if role else []
+
+    # ユーザーメンション <@!ID> または <@ID>
+    um = re.match(r'^<@!?(?P<id>\d+)>$', raw)
+    if um:
+        uid = int(um.group("id"))
+        member = guild.get_member(uid) or await guild.fetch_member(uid)
+        return [member] if member else []
+
+    # @ロール名 の場合
+    if raw.startswith("@") or raw.startswith("＠"):
+        name = raw.lstrip("@\uFF20").strip()
+        role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
+        if role:
+            return role.members
+        starts = [r for r in guild.roles if r.name.lower().startswith(name.lower())]
+        if starts:
+            return starts[0].members
+        contains = [r for r in guild.roles if name.lower() in r.name.lower()]
+        if contains:
+            return contains[0].members
+        return []
+
+    # 数字のみ → member または role
+    if raw.isdigit():
+        uid = int(raw)
+        member = guild.get_member(uid) or await guild.fetch_member(uid)
+        if member:
+            return [member]
+        role = guild.get_role(uid)
+        if role:
+            return role.members
+
+    # 名前やニックネーム
+    found = [m for m in guild.members if m.name == raw or (m.nick and m.nick == raw)]
+    if found:
+        return found[:50]
+
+    partial = [m for m in guild.members if raw.lower() in m.name.lower() or (m.nick and raw.lower() in m.nick.lower())]
+    return partial[:50]
+
+# ---------- 共通 DB 更新関数 ----------
+import sqlite3
+import asyncio
+
+def update_balance(member_ids: list[int], amount: int, db_path: str, add: bool = True):
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    cur = conn.cursor()
+    # テーブル作成
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            balance INTEGER DEFAULT 0,
+            total_received INTEGER DEFAULT 0,
+            total_spent INTEGER DEFAULT 0
+        )
+    """)
+    # INSERT OR IGNORE
+    cur.executemany(
+        "INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?, 0, 0, 0)",
+        [(uid,) for uid in member_ids]
+    )
+    # 更新
+    if add:
+        cur.executemany(
+            "UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
+            [(amount, amount, uid) for uid in member_ids]
+        )
+    else:
+        cur.executemany(
+            "UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?",
+            [(amount, amount, uid) for uid in member_ids]
+        )
+    conn.commit()
+    conn.close()
+
+# ---------- /配布 ----------
+@tree.command(name="配布", description="指定ユーザーやロールにRaruinを付与（管理者専用）")
+@app_commands.describe(target="ユーザーまたはロール", amount="付与額")
 async def distribute(interaction: discord.Interaction, target: str, amount: int):
     if not await is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
@@ -429,43 +519,23 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
     if amount <= 0:
         await interaction.response.send_message("⚠️ 付与額は1以上にしてください。", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
 
+    await interaction.response.defer(ephemeral=True)
     members = await resolve_target_members(target, interaction)
     if not members:
-        await interaction.followup.send("❌ 対象ユーザーが見つかりません。", ephemeral=True)
+        await interaction.followup.send("❌ 対象が見つかりません。", ephemeral=True)
         return
 
     member_ids = [m.id for m in members]
     loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, update_balance, member_ids, amount, "main.db", True)
 
-    def _add_balance_batch(member_ids, amt, db_path):
-        conn = sqlite3.connect(db_path, timeout=30)
-        cur = conn.cursor()
-        conn.execute("PRAGMA journal_mode=WAL;")
-        # ユーザーをまとめて追加
-        cur.executemany(
-            "INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?, 0, 0, 0)",
-            [(uid,) for uid in member_ids]
-        )
-        # 残高と累計受取をまとめて更新
-        cur.executemany(
-            "UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
-            [(amt, amt, uid) for uid in member_ids]
-        )
-        conn.commit()
-        conn.close()
+    name = members[0].display_name if len(members) == 1 else f"{len(members)} 人のメンバー"
+    await interaction.followup.send(f"🎁 {name} に **{amount:,} Raruin** を付与しました。")
 
-    await loop.run_in_executor(None, _add_balance_batch, member_ids, amount, DB_PATH)
-
-    target_name = members[0].display_name if len(members) == 1 else f"{len(members)}人のメンバー"
-    await interaction.followup.send(f"🎁 {target_name} に **{amount:,} Raruin** を付与しました。")
-
-# --------------------
-# /支払い
-# --------------------
-@tree.command(name="支払い", description="指定したユーザーまたはロールのRaruinを減らす（管理者専用）")
-@app_commands.describe(target="ユーザーまたはロール", amount="減算する金額")
+# ---------- /支払い ----------
+@tree.command(name="支払い", description="指定ユーザーやロールのRaruinを減らす（管理者専用）")
+@app_commands.describe(target="ユーザーまたはロール", amount="減らす額")
 async def payment(interaction: discord.Interaction, target: str, amount: int):
     if not await is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
@@ -473,39 +543,19 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
     if amount <= 0:
         await interaction.response.send_message("⚠️ 減算額は1以上にしてください。", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
 
+    await interaction.response.defer(ephemeral=True)
     members = await resolve_target_members(target, interaction)
     if not members:
-        await interaction.followup.send("❌ 対象ユーザーが見つかりません。", ephemeral=True)
+        await interaction.followup.send("❌ 対象が見つかりません。", ephemeral=True)
         return
 
     member_ids = [m.id for m in members]
     loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, update_balance, member_ids, amount, "main.db", False)
 
-    def _subtract_balance_batch(member_ids, amt, db_path):
-        conn = sqlite3.connect(db_path, timeout=30)
-        cur = conn.cursor()
-        conn.execute("PRAGMA journal_mode=WAL;")
-        # ユーザーをまとめて追加
-        cur.executemany(
-            "INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?, 0, 0, 0)",
-            [(uid,) for uid in member_ids]
-        )
-        # 残高を減算し累計支出を加算
-        cur.executemany(
-            "UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?",
-            [(amt, amt, uid) for uid in member_ids]
-        )
-        conn.commit()
-        conn.close()
-
-    await loop.run_in_executor(None, _subtract_balance_batch, member_ids, amount, DB_PATH)
-
-    target_name = members[0].display_name if len(members) == 1 else f"{len(members)}人のメンバー"
-    await interaction.followup.send(f"💸 {target_name} から **{amount:,} Raruin** を減算しました。")
-
-
+    name = members[0].display_name if len(members) == 1 else f"{len(members)} 人のメンバー"
+    await interaction.followup.send(f"💸 {name} から **{amount:,} Raruin** を減算しました。")
 
 # ---------- /ギャンブル確率設定 ----------
 @tree.command(name="ギャンブル確率設定", description="管理者専用: ギャンブル確率レベル変更")
