@@ -137,8 +137,8 @@ def run_flask():
     try:
         port = int(os.getenv("PORT", "8080"))
         app.run(host='0.0.0.0', port=port)
-except Exception as e:  # ← ここを修正
-    print(f"[on_ready] backup_database start error: {e}")
+    except Exception as e:
+        print(f"⚠️ Flask 起動エラー: {e}")
 
 Thread(target=run_flask, daemon=True).start()
 
@@ -166,7 +166,17 @@ async def on_ready():
     try:
         await tree.sync()
         print("✅ スラッシュコマンド同期済み。")
-    except Excep
+    except Exception as e:
+        print(f"⚠️ コマンド同期エラー: {e}")
+
+    try:
+        if not backup_database.is_running():
+            backup_database.start()
+            print("✅ 自動バックアップ開始。")
+    except Exception as e:
+        print(f"[on_ready] backup_database start error: {e}")
+
+    print("Background tasks started.")
 # ---------- Part 2: 管理者コマンドと通貨操作 (PersistentDB対応) ----------
 
 # ---------- /addr - 管理者追加・削除・一覧 ----------
