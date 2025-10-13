@@ -436,17 +436,24 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
         await interaction.followup.send("❌ 対象ユーザーが見つかりません。", ephemeral=True)
         return
 
+    member_ids = [m.id for m in members]
+
+    loop = asyncio.get_running_loop()
+
     def _add_balance_sync(member_ids, amt, db_path):
         conn = sqlite3.connect(db_path, timeout=30)
         cur = conn.cursor()
+        # ユーザーを存在しなければ追加
         cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids])
-        cur.executemany("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
-                        [(amt, amt, uid) for uid in member_ids])
+        # 残高を加算
+        cur.executemany(
+            "UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
+            [(amt, amt, uid) for uid in member_ids]
+        )
         conn.commit()
         conn.close()
 
-    member_ids = [m.id for m in members]
-    await db.execute(_add_balance_sync, member_ids, amount, DB_PATH)
+    await loop.run_in_executor(None, _add_balance_sync, member_ids, amount, DB_PATH)
 
     target_name = members[0].display_name if len(members) == 1 else f"{len(members)}人のメンバー"
     await interaction.followup.send(f"🎁 {target_name} に **{amount:,} Raruin** を付与しました。")
@@ -470,24 +477,26 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
         await interaction.followup.send("❌ 対象ユーザーが見つかりません。", ephemeral=True)
         return
 
-def _subtract_balance_sync(member_ids, amt, db_path):
-    conn = sqlite3.connect(db_path, timeout=30)
-    cur = conn.cursor()
-    
-    # ユーザーを存在しなければ追加
-    cur.executemany(
-        "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
-        [(member_id,) for member_id in member_ids]
-    )
+    member_ids = [m.id for m in members]
+    loop = asyncio.get_running_loop()
 
-    # 残高を減算
-    cur.executemany(
-        "UPDATE users SET balance = balance - ? WHERE user_id = ?",
-        [(amt, member_id) for member_id in member_ids]
-    )
+    def _subtract_balance_sync(member_ids, amt, db_path):
+        conn = sqlite3.connect(db_path, timeout=30)
+        cur = conn.cursor()
+        # ユーザーを存在しなければ追加
+        cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids])
+        # 残高を減算
+        cur.executemany(
+            "UPDATE users SET balance = balance - ? WHERE user_id=?",
+            [(amt, uid) for uid in member_ids]
+        )
+        conn.commit()
+        conn.close()
 
-    conn.commit()
-    conn.close()
+    await loop.run_in_executor(None, _subtract_balance_sync, member_ids, amount, DB_PATH)
+
+    target_name = members[0].display_name if len(members) == 1 else f"{len(members)}人のメンバー"
+    await interaction.followup.send(f"💸 {target_name} から **{amount:,} Raruin** を減算しました。")
 
 
 
@@ -661,21 +670,25 @@ async def shop(interaction: discord.Interaction,
 async def balance_cmd(interaction: discord.Interaction):
     try:
         await interaction.response.defer(ephemeral=True)
+        loop = asyncio.get_running_loop()
 
-        # ユーザーが存在しなければ追加
-        def _add_user_if_not_exists(uid, db_path):
-            conn = sqlite3.connect(db_path, timeout=10)
+        # ユーザーを追加（存在しなければ）
+        def _add_user(uid, db_path):
+            conn = sqlite3.connect(db_path, timeout=30)
             conn.execute("PRAGMA journal_mode=WAL;")
             cur = conn.cursor()
-            cur.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, ?)", (uid, 0))
+            cur.execute(
+                "INSERT OR IGNORE INTO users (user_id, balance, total_received) VALUES (?, ?, ?)",
+                (uid, 0, 0)
+            )
             conn.commit()
             conn.close()
 
-        await db.execute(_add_user_if_not_exists, interaction.user.id, DB_PATH)
+        await loop.run_in_executor(None, _add_user, interaction.user.id, DB_PATH)
 
-        # 残高取得
-        def _get_balance_sync(uid, db_path):
-            conn = sqlite3.connect(db_path, timeout=10)
+        # 残高を取得
+        def _get_balance(uid, db_path):
+            conn = sqlite3.connect(db_path, timeout=30)
             conn.execute("PRAGMA journal_mode=WAL;")
             cur = conn.cursor()
             cur.execute("SELECT balance FROM users WHERE user_id=?", (uid,))
@@ -683,7 +696,8 @@ async def balance_cmd(interaction: discord.Interaction):
             conn.close()
             return r[0] if r else 0
 
-        balance = await db.execute(_get_balance_sync, interaction.user.id, DB_PATH)
+        balance = await loop.run_in_executor(None, _get_balance, interaction.user.id, DB_PATH)
+
         await interaction.followup.send(f"💰 あなたの残高は {balance} Raruin です。")
     except Exception as e:
         print(f"[balance_cmd] error: {e}")
