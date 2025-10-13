@@ -661,8 +661,19 @@ async def shop(interaction: discord.Interaction,
 async def balance_cmd(interaction: discord.Interaction):
     try:
         await interaction.response.defer(ephemeral=True)
-        await db.execute(_add_user_if_not_exists_sync, interaction.user.id, DB_PATH)
 
+        # ユーザーが存在しなければ追加
+        def _add_user_if_not_exists(uid, db_path):
+            conn = sqlite3.connect(db_path, timeout=10)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            cur = conn.cursor()
+            cur.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, ?)", (uid, 0))
+            conn.commit()
+            conn.close()
+
+        await db.execute(_add_user_if_not_exists, interaction.user.id, DB_PATH)
+
+        # 残高取得
         def _get_balance_sync(uid, db_path):
             conn = sqlite3.connect(db_path, timeout=10)
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -885,7 +896,33 @@ async def transfer(interaction: discord.Interaction, target: discord.User, amoun
         print(f"[transfer] error: {e}")
         await interaction.response.send_message("⚠️ エラーが発生しました。")
 
+# 今日の収支
+@tree.command(name="今日の収支", description="今日の収支を確認します")
+async def daily_profit(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    conn = get_conn()
+    c = conn.cursor()
+    today = datetime.now().strftime("%Y-%m-%d")
+    c.execute("SELECT SUM(total_received - total_spent) FROM users WHERE user_id=? AND last_daily LIKE ?", (user_id, today+'%'))
+    row = c.fetchone()
+    profit = row[0] if row and row[0] else 0
+    conn.close()
+    await interaction.response.send_message(f"📊 今日の収支: {profit} Raruin")
 
+# リーダーボード
+@tree.command(name="リーダーボード", description="Raruin 残高ランキング")
+async def leaderboard(interaction: discord.Interaction):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 10")
+    rows = c.fetchall()
+    conn.close()
+    msg = "🏆 Raruin リーダーボード\n"
+    for i, (uid, bal) in enumerate(rows, 1):
+        msg += f"{i}. <@{uid}> — {bal} Raruin\n"
+    await interaction.response.send_message(msg)
+
+        
 # ---------- /ヘルプ ----------
 @tree.command(name="ヘルプ", description="Botの全コマンド一覧を表示します")
 async def help_cmd(interaction: discord.Interaction):
