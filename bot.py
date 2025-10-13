@@ -233,7 +233,7 @@ async def addr(interaction: discord.Interaction, action: str, target: str = None
 
 # ---------- /配布 ----------
 @tree.command(name="配布", description="指定したユーザーやロールにRaruinを付与（管理者専用）")
-@app_commands.describe(target="ユーザー（@で指定可）またはロール名/ID/ユーザー名", amount="付与額")
+@app_commands.describe(target="ユーザーまたはロール", amount="付与額")
 async def distribute(interaction: discord.Interaction, target: str, amount: int):
     if not await is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
@@ -245,37 +245,44 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
     members = await resolve_target_members(target, interaction)
     if not members:
         role_obj = _find_role_from_input(target, interaction.guild)
-        if role_obj and role_obj.members:
+        if role_obj:
             members = role_obj.members
-        elif role_obj:
-            await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は存在しますがメンバーがいません。", ephemeral=True)
-            return
     if not members:
         await interaction.response.send_message("❌ 対象が見つかりません。", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
 
-    def _add_balance(member_ids, amt):
-        conn = db._connect()
+    async def _add_balance(member_ids, amt):
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         cur = conn.cursor()
-        for uid in member_ids:
-            cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
-            cur.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
-                        (amt, amt, uid))
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                balance INTEGER DEFAULT 0,
+                total_received INTEGER DEFAULT 0,
+                total_spent INTEGER DEFAULT 0
+            )
+        """)
+        # まとめて更新
+        cur.executemany(
+            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
+            [(uid,) for uid in member_ids]
+        )
+        cur.executemany(
+            "UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
+            [(amt, amt, uid) for uid in member_ids]
+        )
         conn.commit()
         conn.close()
 
-    member_ids = [m.id for m in members]
-    await db.execute(_add_balance, member_ids, amount)
-
-    name = members[0].display_name if len(members) == 1 else f"{len(members)} 件のメンバー"
+    await db.execute(_add_balance, [m.id for m in members], amount)
+    name = members[0].display_name if len(members)==1 else f"{len(members)} 件のメンバー"
     await interaction.followup.send(f"🎁 {name} に {amount} Raruin を付与しました。")
-
 
 # ---------- /支払い ----------
 @tree.command(name="支払い", description="指定したユーザーやロールのRaruinを減らす（管理者専用）")
-@app_commands.describe(target="ユーザー（@で指定可）またはロール名/ID/ユーザー名", amount="減らす額")
+@app_commands.describe(target="ユーザーまたはロール", amount="減らす額")
 async def payment(interaction: discord.Interaction, target: str, amount: int):
     if not await is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
@@ -287,32 +294,40 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
     members = await resolve_target_members(target, interaction)
     if not members:
         role_obj = _find_role_from_input(target, interaction.guild)
-        if role_obj and role_obj.members:
+        if role_obj:
             members = role_obj.members
-        elif role_obj:
-            await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は存在しますがメンバーがいません。", ephemeral=True)
-            return
     if not members:
         await interaction.response.send_message("❌ 対象が見つかりません。", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
 
-    def _subtract_balance(member_ids, amt):
-        conn = db._connect()
+    async def _subtract_balance(member_ids, amt):
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         cur = conn.cursor()
-        for uid in member_ids:
-            cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
-            cur.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?",
-                        (amt, amt, uid))
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                balance INTEGER DEFAULT 0,
+                total_received INTEGER DEFAULT 0,
+                total_spent INTEGER DEFAULT 0
+            )
+        """)
+        cur.executemany(
+            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
+            [(uid,) for uid in member_ids]
+        )
+        cur.executemany(
+            "UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?",
+            [(amt, amt, uid) for uid in member_ids]
+        )
         conn.commit()
         conn.close()
 
-    member_ids = [m.id for m in members]
-    await db.execute(_subtract_balance, member_ids, amount)
-
-    name = members[0].display_name if len(members) == 1 else f"{len(members)} 件のメンバー"
+    await db.execute(_subtract_balance, [m.id for m in members], amount)
+    name = members[0].display_name if len(members)==1 else f"{len(members)} 件のメンバー"
     await interaction.followup.send(f"💸 {name} から {amount} Raruin を減算しました。")
+
 # ---------- /ギャンブル確率設定 ----------
 @tree.command(name="ギャンブル確率設定", description="管理者専用: ギャンブル確率レベル変更")
 @app_commands.describe(probability="1=当たりやすい, 6=当たりにくい")
