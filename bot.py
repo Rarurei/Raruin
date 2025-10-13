@@ -1,26 +1,67 @@
 import os
 import sqlite3
+import asyncio
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord import app_commands
-from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
-from github_backup import download_latest_db, upload_db_to_release
-import asyncio
+from dotenv import load_dotenv
+from datetime import datetime
 
 # --------------------
-# PersistentDB ラッパー
+# .env読み込みと初期設定
+# --------------------
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
+OWNER_ID = 1402613707527426131
+
+if not TOKEN:
+    raise ValueError("❌ 環境変数 DISCORD_TOKEN が設定されていません。")
+
+# --------------------
+# Flaskサーバー (Render/uptimerobot維持用)
+# --------------------
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Raruin BOT is running!"
+
+def run_flask():
+    try:
+        app.run(host="0.0.0.0", port=8080)
+    except Exception as e:
+        print(f"Flask 起動エラー: {e}")
+
+Thread(target=run_flask, daemon=True).start()
+
+# --------------------
+# Discord Bot設定
+# --------------------
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+
+# --------------------
+# PersistentDB クラス（Render永続化対応版）
 # --------------------
 class PersistentDB:
     def __init__(self, db_path: str):
-        self.db_path = db_path
+        # Render環境では/dataディレクトリに保存
+        if not os.path.exists("/data"):
+            print("⚠️ /data が存在しないため、ローカル main.db を使用します。")
+            db_path = "main.db"
 
-        # ディレクトリが存在しない場合は作成（Render 対応）
+        self.db_path = db_path
         db_dir = os.path.dirname(db_path)
+
         if db_dir and not os.path.exists(db_dir):
             try:
                 os.makedirs(db_dir, exist_ok=True)
+                print(f"✅ ディレクトリ作成: {db_dir}")
             except Exception as e:
                 print(f"⚠️ ディレクトリ作成エラー: {db_dir} ({e})")
 
@@ -44,139 +85,114 @@ class PersistentDB:
             raise
 
     def _ensure_tables(self):
-        conn = self._connect()
-        c = conn.cursor()
-        c.executescript('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            balance INTEGER DEFAULT 0,
-            total_received INTEGER DEFAULT 0,
-            total_spent INTEGER DEFAULT 0,
-            daily_streak INTEGER DEFAULT 0,
-            last_daily TEXT
-        );
+        try:
+            conn = self._connect()
+            c = conn.cursor()
+            c.executescript('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                balance INTEGER DEFAULT 0,
+                total_received INTEGER DEFAULT 0,
+                total_spent INTEGER DEFAULT 0,
+                daily_streak INTEGER DEFAULT 0,
+                last_daily TEXT
+            );
 
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY
-        );
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY
+            );
 
-        CREATE TABLE IF NOT EXISTS shops (
-            shop_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE
-        );
+            CREATE TABLE IF NOT EXISTS shops (
+                shop_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE
+            );
 
-        CREATE TABLE IF NOT EXISTS shop_items (
-            item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            shop_id INTEGER,
-            name TEXT,
-            description TEXT,
-            price INTEGER,
-            stock TEXT,
-            role_id INTEGER,
-            role_duration INTEGER,
-            FOREIGN KEY (shop_id) REFERENCES shops(shop_id)
-        );
+            CREATE TABLE IF NOT EXISTS shop_items (
+                item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                shop_id INTEGER,
+                name TEXT,
+                description TEXT,
+                price INTEGER,
+                stock TEXT,
+                role_id INTEGER,
+                role_duration INTEGER,
+                FOREIGN KEY (shop_id) REFERENCES shops(shop_id)
+            );
 
-        CREATE TABLE IF NOT EXISTS gamble_settings (
-            id INTEGER PRIMARY KEY,
-            probability_level INTEGER DEFAULT 3
-        );
+            CREATE TABLE IF NOT EXISTS gamble_settings (
+                id INTEGER PRIMARY KEY,
+                probability_level INTEGER DEFAULT 3
+            );
 
-        CREATE TABLE IF NOT EXISTS purchase_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            shop_name TEXT,
-            item_name TEXT,
-            price INTEGER,
-            timestamp TEXT
-        );
-        ''')
-        c.execute("INSERT OR IGNORE INTO gamble_settings (id, probability_level) VALUES (1,3)")
-        conn.commit()
-        conn.close()
+            CREATE TABLE IF NOT EXISTS purchase_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                shop_name TEXT,
+                item_name TEXT,
+                price INTEGER,
+                timestamp TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS daily_earnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                date TEXT,
+                earnings INTEGER
+            );
+            ''')
+            c.execute("INSERT OR IGNORE INTO gamble_settings (id, probability_level) VALUES (1,3)")
+            conn.commit()
+            conn.close()
+            print("✅ DB テーブル確認・作成完了")
+        except Exception as e:
+            print(f"❌ DB 初期化中にエラー: {e}")
 
     async def execute(self, func, *args, **kwargs):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, func, *args, **kwargs)
 
-
 # --------------------
-# 環境変数読み込み
+# DB 初期化
 # --------------------
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-DB_PATH = os.getenv("DB_PATH", "/data/main.db")  # /data 配下に永続化
-OWNER_ID = int(os.getenv("OWNER_ID", "1402613707527426131"))
-BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0") or 0)
-
-# PersistentDB インスタンス
+DB_PATH = "/data/main.db"
 db = PersistentDB(DB_PATH)
 
-# GitHub Releases から最新 DB を取得
-try:
-    if download_latest_db():
-        print("✅ GitHub から最新の main.db を取得しました。")
-    else:
-        print("⚠️ Release に main.db が見つかりません。新規作成します。")
-except Exception as e:
-    print(f"⚠️ DB ダウンロード中にエラー: {e}")
+# --------------------
+# ユーザー追加・残高操作関数
+# --------------------
+def add_user_if_not_exists(user_id: int):
+    conn = db._connect()
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", (user_id,))
+    conn.commit()
+    conn.close()
 
-# ---------- Discord Bot 初期化 ----------
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="/", intents=intents)
-tree = bot.tree
+def get_balance(user_id: int) -> int:
+    conn = db._connect()
+    c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0
 
-# ===== Flask keep_alive =====
-app = Flask(__name__)
-@app.route('/')
-def home():
-    return "Raruin Bot Running!"
+def update_balance(user_id: int, amount: int):
+    conn = db._connect()
+    c = conn.cursor()
+    c.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user_id))
+    conn.commit()
+    conn.close()
 
-def run_flask():
-    try:
-        port = int(os.getenv("PORT", "8080"))
-        app.run(host='0.0.0.0', port=port)
-    except Exception as e:
-        print(f"⚠️ Flask 起動エラー: {e}")
-
-Thread(target=run_flask, daemon=True).start()
-
-# ---------- GitHub Releases 自動バックアップタスク ----------
-@tasks.loop(hours=24)
-async def backup_database():
-    try:
-        upload_db_to_release()
-        print("✅ GitHub Releases に main.db をバックアップしました。")
-        if BACKUP_CHANNEL_ID and os.path.exists(DB_PATH):
-            channel = bot.get_channel(BACKUP_CHANNEL_ID)
-            if channel:
-                await channel.send(file=discord.File(DB_PATH))
-    except Exception as e:
-        print(f"[backup_database] エラー: {e}")
-
-@backup_database.before_loop
-async def before_backup():
-    await bot.wait_until_ready()
-
-# ---------- on_ready イベント ----------
+# --------------------
+# イベント: 起動時
+# --------------------
 @bot.event
 async def on_ready():
     print(f"✅ ログイン完了: {bot.user}")
     try:
         await tree.sync()
-        print("✅ スラッシュコマンド同期済み。")
+        print("✅ スラッシュコマンドを同期しました。")
     except Exception as e:
         print(f"⚠️ コマンド同期エラー: {e}")
-
-    try:
-        if not backup_database.is_running():
-            backup_database.start()
-            print("✅ 自動バックアップ開始。")
-    except Exception as e:
-        print(f"[on_ready] backup_database start error: {e}")
-
-    print("Background tasks started.")
 # ---------- Part 2: 管理者コマンドと通貨操作 (PersistentDB対応) ----------
 
 # ---------- /addr - 管理者追加・削除・一覧 ----------
@@ -238,75 +254,140 @@ async def addr(interaction: discord.Interaction, action: str, target: str = None
     msg = f"{user.mention} を管理者に追加しました。" if action=="add" else f"{user.mention} を管理者から削除しました。"
     await interaction.response.send_message(msg)
 
+# ---------- 管理者チェック ----------
+async def is_admin(user_id: int) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,))
+    result = c.fetchone()
+    conn.close()
+    return result is not None or user_id == OWNER_ID
+
+# ---------- ターゲット解決 ----------
+async def resolve_target_members(target: str, interaction: discord.Interaction):
+    members = []
+
+    # ユーザーIDまたはメンション形式
+    if target.startswith("<@") and target.endswith(">"):
+        user_id = int(target.replace("<@", "").replace("!", "").replace(">", ""))
+        member = interaction.guild.get_member(user_id)
+        if member:
+            members.append(member)
+
+    # ロールメンション
+    elif target.startswith("<@&") and target.endswith(">"):
+        role_id = int(target.replace("<@&", "").replace(">", ""))
+        role = interaction.guild.get_role(role_id)
+        if role:
+            members.extend(role.members)
+
+    return members
+
+# ---------- ロール検索（絵文字対応） ----------
+def _find_role_from_input(input_name: str, guild: discord.Guild):
+    for role in guild.roles:
+        if role.name == input_name or input_name.strip() in role.name:
+            return role
+    return None
+
 # ---------- /配布 ----------
-@tree.command(name="配布", description="指定したユーザーやロールにRaruinを付与（管理者専用）")
-@app_commands.describe(target="ユーザーまたはロール", amount="付与額")
+@tree.command(name="配布", description="指定したユーザーまたはロールにRaruinを付与（管理者専用）")
+@app_commands.describe(target="ユーザーまたはロール（@メンション可）", amount="付与する金額")
 async def distribute(interaction: discord.Interaction, target: str, amount: int):
-    if not await is_admin(interaction.user.id):
-        await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
-        return
-    if amount <= 0:
-        await interaction.response.send_message("⚠️ 付与額は1以上にしてください。", ephemeral=True)
-        return
+    try:
+        # 管理者チェック
+        if not await is_admin(interaction.user.id):
+            await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
+            return
 
-    members = await resolve_target_members(target, interaction)
-    if not members:
-        role_obj = _find_role_from_input(target, interaction.guild)
-        if role_obj:
-            members = role_obj.members
-    if not members:
-        await interaction.response.send_message("❌ 対象が見つかりません。", ephemeral=True)
-        return
+        if amount <= 0:
+            await interaction.response.send_message("⚠️ 付与額は1以上にしてください。", ephemeral=True)
+            return
 
-    await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=True)  # 遅延応答（応答エラー防止）
 
-    async def _add_balance(member_ids, amt):
-        conn = sqlite3.connect(DB_PATH, timeout=30)
-        cur = conn.cursor()
-        cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids])
-        cur.executemany("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
-                        [(amt, amt, uid) for uid in member_ids])
-        conn.commit()
-        conn.close()
+        # 対象取得
+        members = await resolve_target_members(target, interaction)
+        if not members:
+            role_obj = _find_role_from_input(target, interaction.guild)
+            if role_obj:
+                members = role_obj.members
+        if not members:
+            await interaction.followup.send("❌ 対象ユーザーまたはロールが見つかりません。", ephemeral=True)
+            return
 
-    await db.execute(_add_balance, [m.id for m in members], amount)
-    name = members[0].display_name if len(members) == 1 else f"{len(members)} 件のメンバー"
-    await interaction.followup.send(f"🎁 {name} に {amount} Raruin を付与しました。")
+        # --- 残高加算処理 ---
+        async def _add_balance(member_ids, amt):
+            conn = sqlite3.connect(DB_PATH, timeout=30)
+            cur = conn.cursor()
+            cur.executemany("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", [(uid,) for uid in member_ids])
+            cur.executemany("""
+                UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?
+            """, [(amt, amt, uid) for uid in member_ids])
+            conn.commit()
+            conn.close()
+
+        await db.execute(_add_balance, [m.id for m in members], amount)
+
+        target_name = (
+            members[0].display_name
+            if len(members) == 1
+            else f"{len(members)}人のメンバー"
+        )
+        await interaction.followup.send(f"🎁 {target_name} に **{amount:,} Raruin** を付与しました。")
+
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ エラーが発生しました: {e}", ephemeral=True)
+
 
 # ---------- /支払い ----------
-@tree.command(name="支払い", description="指定したユーザーやロールのRaruinを減らす（管理者専用）")
-@app_commands.describe(target="ユーザーまたはロール", amount="減らす額")
+@tree.command(name="支払い", description="指定したユーザーまたはロールのRaruinを減らす（管理者専用）")
+@app_commands.describe(target="ユーザーまたはロール（@メンション可）", amount="減算する金額")
 async def payment(interaction: discord.Interaction, target: str, amount: int):
-    if not await is_admin(interaction.user.id):
-        await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
-        return
-    if amount <= 0:
-        await interaction.response.send_message("⚠️ 減算額は1以上にしてください。", ephemeral=True)
-        return
+    try:
+        # 管理者チェック
+        if not await is_admin(interaction.user.id):
+            await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
+            return
 
-    members = await resolve_target_members(target, interaction)
-    if not members:
-        role_obj = _find_role_from_input(target, interaction.guild)
-        if role_obj:
-            members = role_obj.members
-    if not members:
-        await interaction.response.send_message("❌ 対象が見つかりません。", ephemeral=True)
-        return
+        if amount <= 0:
+            await interaction.response.send_message("⚠️ 減算額は1以上にしてください。", ephemeral=True)
+            return
 
-    await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=True)  # 遅延応答（応答エラー防止）
 
-    async def _subtract_balance(member_ids, amt):
-        conn = sqlite3.connect(DB_PATH, timeout=30)
-        cur = conn.cursor()
-        cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids])
-        cur.executemany("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?",
-                        [(amt, amt, uid) for uid in member_ids])
-        conn.commit()
-        conn.close()
+        # 対象取得
+        members = await resolve_target_members(target, interaction)
+        if not members:
+            role_obj = _find_role_from_input(target, interaction.guild)
+            if role_obj:
+                members = role_obj.members
+        if not members:
+            await interaction.followup.send("❌ 対象ユーザーまたはロールが見つかりません。", ephemeral=True)
+            return
 
-    await db.execute(_subtract_balance, [m.id for m in members], amount)
-    name = members[0].display_name if len(members) == 1 else f"{len(members)} 件のメンバー"
-    await interaction.followup.send(f"💸 {name} から {amount} Raruin を減算しました。")
+        # --- 残高減算処理 ---
+        async def _subtract_balance(member_ids, amt):
+            conn = sqlite3.connect(DB_PATH, timeout=30)
+            cur = conn.cursor()
+            cur.executemany("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)", [(uid,) for uid in member_ids])
+            cur.executemany("""
+                UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?
+            """, [(amt, amt, uid) for uid in member_ids])
+            conn.commit()
+            conn.close()
+
+        await db.execute(_subtract_balance, [m.id for m in members], amount)
+
+        target_name = (
+            members[0].display_name
+            if len(members) == 1
+            else f"{len(members)}人のメンバー"
+        )
+        await interaction.followup.send(f"💸 {target_name} から **{amount:,} Raruin** を減算しました。")
+
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ エラーが発生しました: {e}", ephemeral=True)
 
 # ---------- /ギャンブル確率設定 ----------
 @tree.command(name="ギャンブル確率設定", description="管理者専用: ギャンブル確率レベル変更")
