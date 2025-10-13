@@ -37,10 +37,7 @@ def home():
     return "Raruin BOT is running!"
 
 def run_flask():
-    try:
-        port = int(os.getenv("PORT", "8080"))
-    except:
-        port = 8080
+    port = int(os.getenv("PORT", "8080"))
     try:
         app.run(host="0.0.0.0", port=port)
     except Exception as e:
@@ -132,18 +129,15 @@ def upload_db_to_release():
         if not GITHUB_REPO or not GITHUB_TOKEN:
             print("ℹ️ GitHub 情報が未設定のためアップロードをスキップします。")
             return False
-
         releases = _get_releases()
         if releases is None:
             print("⚠️ GitHub Releases を取得できませんでした（アップロード中止）。")
             return False
-
         existing_release_id = None
         for r in releases:
             if r.get("tag_name") == RELEASE_TAG:
                 existing_release_id = r.get("id")
                 break
-
         if existing_release_id:
             del_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/{existing_release_id}"
             rdel = requests.delete(del_url, headers=_gh_headers(), timeout=15)
@@ -151,7 +145,6 @@ def upload_db_to_release():
                 print("🗑️ 既存リリースを削除しました（置換）。")
             else:
                 print(f"⚠️ 既存リリース削除に失敗: {rdel.status_code} {rdel.text[:200]}")
-
         create_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
         payload = {
             "tag_name": RELEASE_TAG,
@@ -168,7 +161,6 @@ def upload_db_to_release():
         if not upload_url_template:
             print("⚠️ upload_url が取得できませんでした。")
             return False
-
         with open(DB_PATH, "rb") as fh:
             params = {"name": ASSET_NAME}
             headers = {"Authorization": f"token {GITHUB_TOKEN}", "Content-Type": "application/octet-stream"}
@@ -179,7 +171,6 @@ def upload_db_to_release():
             else:
                 print(f"⚠️ アセットアップロード失敗: {ru.status_code} {ru.text[:300]}")
                 return False
-
     except Exception as e:
         print(f"[upload_db_to_release] エラー: {e}")
         return False
@@ -277,8 +268,9 @@ class PersistentDB:
         return await loop.run_in_executor(None, func, *args, **kwargs)
 
 # --------------------
-# DB ダウンロード
+# DB ダウンロード（起動前に必ず復元）
 # --------------------
+print("🟡 起動前: GitHub から最新 DB を復元します...")
 try:
     downloaded = download_latest_db()
     if downloaded:
@@ -288,138 +280,16 @@ try:
 except Exception as e:
     print(f"⚠️ 起動時 DB ダウンロード中にエラー: {e}")
 
+# --------------------
+# PersistentDB 初期化（復元済み DB を使用）
+# --------------------
 db = PersistentDB(DB_PATH)
 
-# --------------------
-# 自動バックアップタスク
-# --------------------
-@tasks.loop(hours=6)
-async def auto_backup_task():
-    try:
-        await bot.wait_until_ready()
-        result = await asyncio.to_thread(upload_db_to_release)
-        if result:
-            print("✅ 自動バックアップ成功（GitHub）。")
-            try:
-                if BACKUP_CHANNEL_ID:
-                    ch = bot.get_channel(BACKUP_CHANNEL_ID)
-                    if ch and os.path.exists(DB_PATH):
-                        await ch.send("🗄️ 自動バックアップを実行しました。", file=discord.File(DB_PATH))
-            except Exception as e:
-                print(f"[auto_backup_task] チャンネル通知エラー: {e}")
-        else:
-            print("⚠️ 自動バックアップに失敗しました。")
-    except Exception as e:
-        print(f"[auto_backup_task] エラー: {e}")
-
-@auto_backup_task.before_loop
-async def before_auto_backup():
-    await bot.wait_until_ready()
-
-# --------------------
-# ユーザー残高関連
-# --------------------
-def add_user_if_not_exists_sync(user_id: int):
-    conn = None
-    try:
-        conn = db._connect()
-        cur = conn.cursor()
-        cur.execute("INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?,0,0,0)", (user_id,))
-        conn.commit()
-    except Exception as e:
-        print(f"[add_user_if_not_exists_sync] エラー: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-async def add_user_if_not_exists(user_id: int):
-    await asyncio.to_thread(add_user_if_not_exists_sync, user_id)
-
-def get_balance_sync(user_id: int) -> int:
-    conn = None
-    try:
-        conn = db._connect()
-        cur = conn.cursor()
-        cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-        row = cur.fetchone()
-        return int(row[0]) if row else 0
-    except Exception as e:
-        print(f"[get_balance_sync] エラー: {e}")
-        return 0
-    finally:
-        if conn:
-            conn.close()
-
-async def get_balance(user_id: int) -> int:
-    return await asyncio.to_thread(get_balance_sync, user_id)
-
-def update_balance_sync(user_id: int, amount: int):
-    conn = None
-    try:
-        conn = db._connect()
-        cur = conn.cursor()
-        cur.execute("INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?,0,0,0)", (user_id,))
-        if amount >= 0:
-            cur.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?", (amount, amount, user_id))
-        else:
-            cur.execute("UPDATE users SET balance = balance + ?, total_spent = total_spent + ? WHERE user_id=?", (amount, -amount, user_id))
-        conn.commit()
-    except Exception as e:
-        print(f"[update_balance_sync] エラー: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-async def update_balance(user_id: int, amount: int):
-    await asyncio.to_thread(update_balance_sync, user_id, amount)
-
-# --------------------
-# 管理者チェック
-# --------------------
-async def is_admin(user_id: int) -> bool:
-    def _check():
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)")
-        cur.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,))
-        r = cur.fetchone()
-        conn.close()
-        return r is not None
-    try:
-        is_admin_db = await db.execute(_check)
-        return is_admin_db or (user_id == OWNER_ID)
-    except Exception as e:
-        print(f"[is_admin] DB error: {e}")
-        return user_id == OWNER_ID
-
-# --------------------
-# on_ready
-# --------------------
-@bot.event
-async def on_ready():
-    print("===================================================")
-    print("✅ ログイン完了:", bot.user)
-    print("ID:", bot.user.id)
-    print("日時:", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S (UTC)"))
-    print("DB path:", DB_PATH)
-    print("Owner ID:", OWNER_ID)
-    print("===================================================")
-    try:
-        await tree.sync()
-        print("✅ スラッシュコマンドを同期しました。")
-    except Exception as e:
-        print(f"⚠️ スラッシュコマンド同期エラー: {e}")
-    try:
-        if not auto_backup_task.is_running():
-            auto_backup_task.start()
-            print("✅ 自動バックアップタスクを開始しました（6時間毎）。")
-    except Exception as e:
-        print(f"[on_ready] auto_backup_task start error: {e}")
-    print("Bot is ready.")
 
 # ---------- ヘルパー: ターゲット解決 ----------
 import re
-from typing import List, Optional
+from typing import List
+import discord
 
 async def resolve_target_members(target: str, interaction: discord.Interaction) -> List[discord.Member]:
     guild = interaction.guild
@@ -441,7 +311,7 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
         member = guild.get_member(uid) or await guild.fetch_member(uid)
         return [member] if member else []
 
-    # @ロール名 の場合
+    # @ロール名
     if raw.startswith("@") or raw.startswith("＠"):
         name = raw.lstrip("@\uFF20").strip()
         role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
@@ -465,7 +335,7 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
         if role:
             return role.members
 
-    # 名前やニックネーム
+    # 名前/ニックネーム
     found = [m for m in guild.members if m.name == raw or (m.nick and m.nick == raw)]
     if found:
         return found[:50]
@@ -473,41 +343,44 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
     partial = [m for m in guild.members if raw.lower() in m.name.lower() or (m.nick and raw.lower() in m.nick.lower())]
     return partial[:50]
 
-# ---------- 共通 DB 更新関数 ----------
+# ---------- DB 更新（スレッドセーフ） ----------
 import sqlite3
-import asyncio
 
-def update_balance(member_ids: list[int], amount: int, db_path: str, add: bool = True):
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    cur = conn.cursor()
-    # テーブル作成
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            balance INTEGER DEFAULT 0,
-            total_received INTEGER DEFAULT 0,
-            total_spent INTEGER DEFAULT 0
-        )
-    """)
-    # INSERT OR IGNORE
-    cur.executemany(
-        "INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?, 0, 0, 0)",
-        [(uid,) for uid in member_ids]
-    )
-    # 更新
-    if add:
+def _update_balance(member_ids: list[int], amount: int, db_path: str, add: bool = True):
+    try:
+        conn = sqlite3.connect(db_path, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                balance INTEGER DEFAULT 0,
+                total_received INTEGER DEFAULT 0,
+                total_spent INTEGER DEFAULT 0
+            )
+        """)
         cur.executemany(
-            "UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
-            [(amount, amount, uid) for uid in member_ids]
+            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
+            [(uid,) for uid in member_ids]
         )
-    else:
-        cur.executemany(
-            "UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?",
-            [(amount, amount, uid) for uid in member_ids]
-        )
-    conn.commit()
-    conn.close()
+        if add:
+            cur.executemany(
+                "UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
+                [(amount, amount, uid) for uid in member_ids]
+            )
+        else:
+            cur.executemany(
+                "UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?",
+                [(amount, amount, uid) for uid in member_ids]
+            )
+        conn.commit()
+    except Exception as e:
+        print(f"[update_balance] エラー: {e}")
+    finally:
+        conn.close()
+
+async def update_balance_async(member_ids: list[int], amount: int, db_path: str, add: bool = True):
+    await asyncio.to_thread(_update_balance, member_ids, amount, db_path, add)
 
 # ---------- /配布 ----------
 @tree.command(name="配布", description="指定ユーザーやロールにRaruinを付与（管理者専用）")
@@ -527,8 +400,7 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
         return
 
     member_ids = [m.id for m in members]
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, update_balance, member_ids, amount, "main.db", True)
+    await update_balance_async(member_ids, amount, "main.db", add=True)
 
     name = members[0].display_name if len(members) == 1 else f"{len(members)} 人のメンバー"
     await interaction.followup.send(f"🎁 {name} に **{amount:,} Raruin** を付与しました。")
@@ -551,8 +423,7 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
         return
 
     member_ids = [m.id for m in members]
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, update_balance, member_ids, amount, "main.db", False)
+    await update_balance_async(member_ids, amount, "main.db", add=False)
 
     name = members[0].display_name if len(members) == 1 else f"{len(members)} 人のメンバー"
     await interaction.followup.send(f"💸 {name} から **{amount:,} Raruin** を減算しました。")
