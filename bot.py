@@ -137,8 +137,8 @@ def run_flask():
     try:
         port = int(os.getenv("PORT", "8080"))
         app.run(host='0.0.0.0', port=port)
-    except Exception as e:
-        print(f"Flask 起動エラー: {e}")
+except Exception as e:  # ← ここを修正
+    print(f"[on_ready] backup_database start error: {e}")
 
 Thread(target=run_flask, daemon=True).start()
 
