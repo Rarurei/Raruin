@@ -15,20 +15,33 @@ import asyncio
 class PersistentDB:
     def __init__(self, db_path: str):
         self.db_path = db_path
+
+        # ディレクトリが存在しない場合は作成（Render 対応）
+        db_dir = os.path.dirname(db_path)
+        if db_dir and not os.path.exists(db_dir):
+            try:
+                os.makedirs(db_dir, exist_ok=True)
+            except Exception as e:
+                print(f"⚠️ ディレクトリ作成エラー: {db_dir} ({e})")
+
         self._warn_if_non_persistent_path()
         self._ensure_tables()
 
     def _warn_if_non_persistent_path(self):
         path = os.path.abspath(self.db_path)
-        if not path.startswith(os.getcwd()):
+        if not path.startswith("/data"):
             print(f"⚠️ 注意: DB_PATH({path}) は永続化されない可能性があります。")
             print("   → GitHub Releases 経由でバックアップを推奨します。")
 
     def _connect(self):
-        conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA foreign_keys = ON;")
-        return conn
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA foreign_keys = ON;")
+            return conn
+        except Exception as e:
+            print(f"❌ DB 接続エラー: {e}")
+            raise
 
     def _ensure_tables(self):
         conn = self._connect()
@@ -86,12 +99,13 @@ class PersistentDB:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, func, *args, **kwargs)
 
+
 # --------------------
 # 環境変数読み込み
 # --------------------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-DB_PATH = os.getenv("DB_PATH", "main.db")
+DB_PATH = os.getenv("DB_PATH", "/data/main.db")  # /data 配下に永続化
 OWNER_ID = int(os.getenv("OWNER_ID", "1402613707527426131"))
 BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0") or 0)
 
@@ -152,44 +166,7 @@ async def on_ready():
     try:
         await tree.sync()
         print("✅ スラッシュコマンド同期済み。")
-    except Exception as e:
-        print(f"⚠️ コマンド同期エラー: {e}")
-
-    try:
-        if not backup_database.is_running():
-            backup_database.start()
-            print("✅ 自動バックアップ開始。")
-    except Exception as e:
-        print(f"[on_ready] backup_database start error: {e}")
-
-    print("Background tasks started.")
-
-# ---------- ユーティリティ関数 ----------
-async def is_admin(user_id: int):
-    def _check():
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,))
-        result = cur.fetchone()
-        conn.close()
-        return bool(result) or user_id == OWNER_ID
-    return await db.execute(_check)
-
-async def resolve_target_members(target: str, interaction: discord.Interaction):
-    members = []
-    # メンション形式
-    if interaction.guild:
-        for member in interaction.guild.members:
-            if str(member.id) == target or member.name == target or member.display_name == target:
-                members.append(member)
-    return members
-
-def _find_role_from_input(target: str, guild: discord.Guild):
-    if not guild:
-        return None
-    return discord.utils.find(lambda r: r.name == target or str(r.id) == target, guild.roles)
-
-# 
+    except Excep
 # ---------- Part 2: 管理者コマンドと通貨操作 (PersistentDB対応) ----------
 
 # ---------- /addr - 管理者追加・削除・一覧 ----------
