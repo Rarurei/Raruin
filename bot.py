@@ -15,18 +15,14 @@ import asyncio
 class PersistentDB:
     def __init__(self, db_path: str):
         self.db_path = db_path
-        # ディレクトリが空文字でなければ作成
-        db_dir = os.path.dirname(db_path)
-        if db_dir:
-            os.makedirs(db_dir, exist_ok=True)
         self._warn_if_non_persistent_path()
         self._ensure_tables()
 
     def _warn_if_non_persistent_path(self):
         path = os.path.abspath(self.db_path)
-        if not path.startswith("/data"):
-            print(f"⚠️ 注意: DB_PATH({path}) は一時フォルダです。再デプロイ時に消える可能性があります。")
-            print("   → GitHub Releases 経由で永続化も行います。")
+        if not path.startswith(os.getcwd()):
+            print(f"⚠️ 注意: DB_PATH({path}) は永続化されない可能性があります。")
+            print("   → GitHub Releases 経由でバックアップを推奨します。")
 
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
@@ -95,16 +91,14 @@ class PersistentDB:
 # --------------------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-DB_PATH = os.getenv("DB_PATH", "/data/main.db")
+DB_PATH = os.getenv("DB_PATH", "main.db")
 OWNER_ID = int(os.getenv("OWNER_ID", "1402613707527426131"))
 BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0") or 0)
 
-# --------------------
 # PersistentDB インスタンス
-# --------------------
 db = PersistentDB(DB_PATH)
 
-# ---------- GitHub Releases から最新 DB を取得 ----------
+# GitHub Releases から最新 DB を取得
 try:
     if download_latest_db():
         print("✅ GitHub から最新の main.db を取得しました。")
@@ -170,6 +164,32 @@ async def on_ready():
 
     print("Background tasks started.")
 
+# ---------- ユーティリティ関数 ----------
+async def is_admin(user_id: int):
+    def _check():
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,))
+        result = cur.fetchone()
+        conn.close()
+        return bool(result) or user_id == OWNER_ID
+    return await db.execute(_check)
+
+async def resolve_target_members(target: str, interaction: discord.Interaction):
+    members = []
+    # メンション形式
+    if interaction.guild:
+        for member in interaction.guild.members:
+            if str(member.id) == target or member.name == target or member.display_name == target:
+                members.append(member)
+    return members
+
+def _find_role_from_input(target: str, guild: discord.Guild):
+    if not guild:
+        return None
+    return discord.utils.find(lambda r: r.name == target or str(r.id) == target, guild.roles)
+
+# 
 # ---------- Part 2: 管理者コマンドと通貨操作 (PersistentDB対応) ----------
 
 # ---------- /addr - 管理者追加・削除・一覧 ----------
@@ -256,28 +276,14 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
     async def _add_balance(member_ids, amt):
         conn = sqlite3.connect(DB_PATH, timeout=30)
         cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                balance INTEGER DEFAULT 0,
-                total_received INTEGER DEFAULT 0,
-                total_spent INTEGER DEFAULT 0
-            )
-        """)
-        # まとめて更新
-        cur.executemany(
-            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
-            [(uid,) for uid in member_ids]
-        )
-        cur.executemany(
-            "UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
-            [(amt, amt, uid) for uid in member_ids]
-        )
+        cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids])
+        cur.executemany("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
+                        [(amt, amt, uid) for uid in member_ids])
         conn.commit()
         conn.close()
 
     await db.execute(_add_balance, [m.id for m in members], amount)
-    name = members[0].display_name if len(members)==1 else f"{len(members)} 件のメンバー"
+    name = members[0].display_name if len(members) == 1 else f"{len(members)} 件のメンバー"
     await interaction.followup.send(f"🎁 {name} に {amount} Raruin を付与しました。")
 
 # ---------- /支払い ----------
@@ -305,27 +311,14 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
     async def _subtract_balance(member_ids, amt):
         conn = sqlite3.connect(DB_PATH, timeout=30)
         cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                balance INTEGER DEFAULT 0,
-                total_received INTEGER DEFAULT 0,
-                total_spent INTEGER DEFAULT 0
-            )
-        """)
-        cur.executemany(
-            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
-            [(uid,) for uid in member_ids]
-        )
-        cur.executemany(
-            "UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?",
-            [(amt, amt, uid) for uid in member_ids]
-        )
+        cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids])
+        cur.executemany("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?",
+                        [(amt, amt, uid) for uid in member_ids])
         conn.commit()
         conn.close()
 
     await db.execute(_subtract_balance, [m.id for m in members], amount)
-    name = members[0].display_name if len(members)==1 else f"{len(members)} 件のメンバー"
+    name = members[0].display_name if len(members) == 1 else f"{len(members)} 件のメンバー"
     await interaction.followup.send(f"💸 {name} から {amount} Raruin を減算しました。")
 
 # ---------- /ギャンブル確率設定 ----------
