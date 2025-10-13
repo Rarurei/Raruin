@@ -2,7 +2,7 @@ import os
 import sqlite3
 import asyncio
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 from flask import Flask
 from threading import Thread
@@ -10,19 +10,28 @@ from dotenv import load_dotenv
 from datetime import datetime
 from typing import List, Optional
 import re
+import requests
+import atexit
+import time
+import json
 
 # --------------------
 # .env読み込みと初期設定
 # --------------------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "1402613707527426131"))
+OWNER_ID = int(os.getenv("OWNER_ID", "1402613707426131"))
+
+# GitHub / backup 設定（Render の Environment Variables に設定しておく）
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_REPO = os.getenv("GITHUB_REPO")  # ex: "YourUser/YourRepo"
+BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0") or 0)
 
 if not TOKEN:
     raise ValueError("❌ 環境変数 DISCORD_TOKEN が設定されていません。")
 
 # --------------------
-# Flaskサーバー (Render/uptimerobot維持用)
+# Flaskサーバー (keep-alive用)
 # --------------------
 app = Flask(__name__)
 
@@ -36,9 +45,9 @@ def run_flask():
     except:
         port = 8080
     try:
+        # Flask をデーモンスレッドで起動（失敗しても Bot を止めない）
         app.run(host="0.0.0.0", port=port)
     except Exception as e:
-        # Flaskの起動に失敗してもBot自体は動くようにする
         print(f"[Flask] 起動エラー: {e}")
 
 Thread(target=run_flask, daemon=True).start()
@@ -53,58 +62,179 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 # --------------------
-# PersistentDB クラス（Render永続化対応版）
+# DB_PATH の決定とディレクトリ作成
+# --------------------
+# 優先順位: 環境変数 DB_PATH -> /data/main.db (存在すれば) -> ./main.db
+_env_db = os.getenv("DB_PATH")
+if _env_db:
+    DB_PATH = _env_db
+else:
+    DB_PATH = "/data/main.db" if os.path.exists("/data") else "main.db"
+
+# Ensure containing directory exists (try to create; permission-safe)
+db_dir = os.path.dirname(os.path.abspath(DB_PATH)) or "."
+if db_dir and not os.path.exists(db_dir):
+    try:
+        os.makedirs(db_dir, exist_ok=True)
+        print(f"✅ DBディレクトリ作成: {db_dir}")
+    except Exception as e:
+        print(f"⚠️ DBディレクトリ作成失敗: {db_dir} ({e})")
+
+# --------------------
+# GitHub Backup ヘルパー（同期関数）
+#   - download_latest_db() : 起動時に Releases から main.db を取得（存在すれば）
+#   - upload_db_to_release() : 現在の DB を Releases にアップロード（古い tag を削除して置換）
+# ※ GITHUB_TOKEN と GITHUB_REPO が必要（環境変数に設定）
+# --------------------
+RELEASE_TAG = "db-backup-automated"
+ASSET_NAME = os.path.basename(DB_PATH) or "main.db"
+
+def _gh_headers():
+    if not GITHUB_TOKEN:
+        return {}
+    return {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+
+def _get_releases():
+    if not GITHUB_REPO or not GITHUB_TOKEN:
+        return None
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
+    r = requests.get(url, headers=_gh_headers(), timeout=15)
+    if r.status_code != 200:
+        print(f"[github] releases fetch failed: {r.status_code} {r.text[:200]}")
+        return None
+    return r.json()
+
+def download_latest_db():
+    """GitHub Releases から最新の DB アセットをダウンロード（存在すれば）。同期処理。"""
+    try:
+        if not GITHUB_REPO or not GITHUB_TOKEN:
+            print("ℹ️ GitHub 情報が未設定のためダウンロードはスキップします。")
+            return False
+        releases = _get_releases()
+        if not releases:
+            print("ℹ️ Release が見つかりません。")
+            return False
+        # 最新リリースから .db アセットを探す
+        for rel in releases:
+            assets = rel.get("assets", [])
+            for a in assets:
+                name = a.get("name", "")
+                if name == ASSET_NAME or name.endswith(".db"):
+                    download_url = a.get("browser_download_url")
+                    if not download_url:
+                        continue
+                    print(f"⬇️ GitHub から DB をダウンロード: {name}")
+                    rr = requests.get(download_url, headers=_gh_headers(), timeout=30)
+                    if rr.status_code == 200:
+                        with open(DB_PATH, "wb") as f:
+                            f.write(rr.content)
+                        print("✅ DB ダウンロード完了")
+                        return True
+                    else:
+                        print(f"⚠️ DB ダウンロード失敗: {rr.status_code} {rr.text[:200]}")
+        print("ℹ️ 適合する DB アセットが見つかりませんでした。")
+        return False
+    except Exception as e:
+        print(f"[download_latest_db] エラー: {e}")
+        return False
+
+def upload_db_to_release():
+    """現在の DB を GitHub Release にアップロード（同期・ブロッキング）。"""
+    try:
+        if not GITHUB_REPO or not GITHUB_TOKEN:
+            print("ℹ️ GitHub 情報が未設定のためアップロードをスキップします。")
+            return False
+
+        # 先に既存の同タグリリースを削除（あれば）
+        releases = _get_releases()
+        if releases is None:
+            print("⚠️ GitHub Releases を取得できませんでした（アップロード中止）。")
+            return False
+
+        existing_release_id = None
+        for r in releases:
+            if r.get("tag_name") == RELEASE_TAG:
+                existing_release_id = r.get("id")
+                break
+
+        if existing_release_id:
+            del_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/{existing_release_id}"
+            rdel = requests.delete(del_url, headers=_gh_headers(), timeout=15)
+            if rdel.status_code in (204, 200):
+                print("🗑️ 既存リリースを削除しました（置換）。")
+            else:
+                print(f"⚠️ 既存リリース削除に失敗: {rdel.status_code} {rdel.text[:200]}")
+
+        # 新しいリリース作成
+        create_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
+        payload = {
+            "tag_name": RELEASE_TAG,
+            "name": "Automated DB Backup",
+            "body": "Auto-backup of main.db by bot",
+            "draft": False,
+            "prerelease": False
+        }
+        rc = requests.post(create_url, headers=_gh_headers(), json=payload, timeout=15)
+        if rc.status_code not in (200, 201):
+            print(f"⚠️ リリース作成失敗: {rc.status_code} {rc.text[:200]}")
+            return False
+        upload_url_template = rc.json().get("upload_url", "").split("{")[0]
+        if not upload_url_template:
+            print("⚠️ upload_url が取得できませんでした。")
+            return False
+
+        # アセットアップロード
+        with open(DB_PATH, "rb") as fh:
+            params = {"name": ASSET_NAME}
+            headers = {"Authorization": f"token {GITHUB_TOKEN}", "Content-Type": "application/octet-stream"}
+            ru = requests.post(upload_url_template, headers=headers, params=params, data=fh, timeout=60)
+            if ru.status_code in (200, 201):
+                print("✅ DB を GitHub Releases にアップロードしました。")
+                return True
+            else:
+                print(f"⚠️ アセットアップロード失敗: {ru.status_code} {ru.text[:300]}")
+                return False
+
+    except Exception as e:
+        print(f"[upload_db_to_release] エラー: {e}")
+        return False
+
+# ensure upload on process exit (best-effort synchronous)
+def _atexit_upload():
+    try:
+        print("🟡 プロセス終了: GitHub に DB をアップロードします（best-effort）...")
+        upload_db_to_release()
+    except Exception as e:
+        print(f"[atexit] upload error: {e}")
+
+atexit.register(_atexit_upload)
+
+# --------------------
+# PersistentDB クラス（Render永続化対応）
 # --------------------
 class PersistentDB:
     def __init__(self, db_path: str):
-        env_db_path = os.getenv("DB_PATH")
-        if env_db_path:
-            db_path = env_db_path
-
-        if os.path.exists("/data"):
-            if not db_path or db_path == "main.db":
-                db_path = "/data/main.db"
-        else:
-            if db_path.startswith("/data"):
-                db_path = "main.db"
-            print("⚠️ /data が存在しないため、DB は作業ディレクトリに保存されます。")
-
+        # env に与えた db_path があればそちらを優先（上で決定済み DB_PATH を使う）
         self.db_path = db_path
-        db_dir = os.path.dirname(os.path.abspath(self.db_path))
-        if db_dir and not os.path.exists(db_dir):
-            try:
-                os.makedirs(db_dir, exist_ok=True)
-                print(f"✅ DBディレクトリ作成: {db_dir}")
-            except Exception as e:
-                print(f"⚠️ DBディレクトリ作成失敗: {db_dir} ({e})")
-
         self._warn_if_non_persistent_path()
-        try:
-            self._ensure_tables()
-        except Exception as e:
-            print(f"❌ DB初期化エラー: {e}")
+        self._ensure_tables()
 
     def _warn_if_non_persistent_path(self):
         path = os.path.abspath(self.db_path)
         if not path.startswith("/data"):
-            print(f"⚠️ 注意: {path} は永続化されない可能性があります。")
+            print(f"⚠️ 注意: DB_PATH({path}) は永続化されない可能性があります。")
+            print("   → GitHub Releases でのバックアップを推奨します。")
 
     def _connect(self):
-        try:
-            conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA foreign_keys = ON;")
-            return conn
-        except Exception as e:
-            print(f"❌ DB接続エラー: {e}")
-            raise
+        conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA foreign_keys = ON;")
+        return conn
 
     def _ensure_tables(self):
-        conn = None
-        try:
-            conn = self._connect()
-            c = conn.cursor()
-            c.executescript('''
+        conn = self._connect()
+        c = conn.cursor()
+        c.executescript('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 balance INTEGER DEFAULT 0,
@@ -155,31 +285,69 @@ class PersistentDB:
                 date TEXT,
                 earnings INTEGER
             );
-            ''')
-            c.execute("INSERT OR IGNORE INTO gamble_settings (id, probability_level) VALUES (1,3)")
-            conn.commit()
-        finally:
-            if conn:
-                conn.close()
+        ''')
+        c.execute("INSERT OR IGNORE INTO gamble_settings (id, probability_level) VALUES (1,3)")
+        conn.commit()
+        conn.close()
 
     async def execute(self, func, *args, **kwargs):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, func, *args, **kwargs)
 
 # --------------------
-# DB初期化
+# 起動時: GitHub から DB を取得（あれば）してから PersistentDB 初期化
 # --------------------
-DB_PATH = os.getenv("DB_PATH") or ("/data/main.db" if os.path.exists("/data") else "main.db")
+# ダウンロードは best-effort（無ければローカル新規作成）
+try:
+    downloaded = download_latest_db()
+    if downloaded:
+        print("✅ 起動時に GitHub から DB を復元しました。")
+    else:
+        print("ℹ️ 起動時の DB 復元はスキップされました。")
+except Exception as e:
+    print(f"⚠️ 起動時 DB ダウンロード中にエラー: {e}")
+
+# 実際の DB オブジェクト
 db = PersistentDB(DB_PATH)
 
+# --------------------
+# 自動バックアップタスク（定期的に GitHub にアップロード）
+# --------------------
+@tasks.loop(hours=6)
+async def auto_backup_task():
+    try:
+        await bot.wait_until_ready()
+        # run upload in thread to avoid blocking event loop
+        result = await asyncio.to_thread(upload_db_to_release)
+        if result:
+            print("✅ 自動バックアップ成功（GitHub）。")
+            # optional: send to backup channel if configured
+            try:
+                if BACKUP_CHANNEL_ID:
+                    ch = bot.get_channel(BACKUP_CHANNEL_ID)
+                    if ch and os.path.exists(DB_PATH):
+                        await ch.send("🗄️ 自動バックアップを実行しました。", file=discord.File(DB_PATH))
+            except Exception as e:
+                print(f"[auto_backup_task] チャンネル通知エラー: {e}")
+        else:
+            print("⚠️ 自動バックアップに失敗しました。")
+    except Exception as e:
+        print(f"[auto_backup_task] エラー: {e}")
+
+@auto_backup_task.before_loop
+async def before_auto_backup():
+    await bot.wait_until_ready()
+
+# start the task when bot is ready (we'll start it in on_ready)
 # --------------------
 # ユーザー関連関数
 # --------------------
 def add_user_if_not_exists_sync(user_id: int):
+    conn = None
     try:
         conn = db._connect()
-        c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?, 0, 0, 0)", (user_id,))
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?, 0, 0, 0)", (user_id,))
         conn.commit()
     except Exception as e:
         print(f"[add_user_if_not_exists_sync] エラー: {e}")
@@ -191,11 +359,12 @@ async def add_user_if_not_exists(user_id: int):
     await asyncio.to_thread(add_user_if_not_exists_sync, user_id)
 
 def get_balance_sync(user_id: int) -> int:
+    conn = None
     try:
         conn = db._connect()
-        c = conn.cursor()
-        c.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
-        row = c.fetchone()
+        cur = conn.cursor()
+        cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
         return int(row[0]) if row else 0
     except Exception as e:
         print(f"[get_balance_sync] エラー: {e}")
@@ -208,14 +377,15 @@ async def get_balance(user_id: int) -> int:
     return await asyncio.to_thread(get_balance_sync, user_id)
 
 def update_balance_sync(user_id: int, amount: int):
+    conn = None
     try:
         conn = db._connect()
-        c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?, 0, 0, 0)", (user_id,))
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?, 0, 0, 0)", (user_id,))
         if amount >= 0:
-            c.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?", (amount, amount, user_id))
+            cur.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?", (amount, amount, user_id))
         else:
-            c.execute("UPDATE users SET balance = balance + ?, total_spent = total_spent + ? WHERE user_id=?", (amount, -amount, user_id))
+            cur.execute("UPDATE users SET balance = balance + ?, total_spent = total_spent + ? WHERE user_id=?", (amount, -amount, user_id))
         conn.commit()
     except Exception as e:
         print(f"[update_balance_sync] エラー: {e}")
@@ -227,7 +397,7 @@ async def update_balance(user_id: int, amount: int):
     await asyncio.to_thread(update_balance_sync, user_id, amount)
 
 # --------------------
-# 起動時イベント
+# 最後に: on_ready で自動バックアップタスクを開始する（ここは既存の on_ready に組み込んでください）
 # --------------------
 @bot.event
 async def on_ready():
@@ -248,48 +418,17 @@ async def on_ready():
     except Exception as e:
         print(f"⚠️ スラッシュコマンド同期エラー: {e}")
 
+    # start backup loop if not running
+    try:
+        if not auto_backup_task.is_running():
+            auto_backup_task.start()
+            print("✅ 自動バックアップタスクを開始しました（6時間毎）。")
+    except Exception as e:
+        print(f"[on_ready] auto_backup_task start error: {e}")
+
     print("Bot is ready.")
 
-# --------------------
-# ユーティリティ: ユーザー存在確認関数
-# --------------------
-def _add_user_if_not_exists_sync(user_id: int, db_path: str):
-    """同期版ユーザー登録関数"""
-    conn = sqlite3.connect(db_path, timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            balance INTEGER DEFAULT 0,
-            total_received INTEGER DEFAULT 0,
-            total_spent INTEGER DEFAULT 0,
-            daily_streak INTEGER DEFAULT 0,
-            last_daily TEXT
-        )
-    """)
-    cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-    conn.commit()
-    conn.close()
-
-def add_user_if_not_exists(user_id: int):
-    """上位互換のシンプル版ラッパー"""
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            balance INTEGER DEFAULT 0,
-            total_received INTEGER DEFAULT 0,
-            total_spent INTEGER DEFAULT 0,
-            daily_streak INTEGER DEFAULT 0,
-            last_daily TEXT
-        )
-    """)
-    cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-    conn.commit()
-    conn.close()
+# --- end of section ---
 
 
 
