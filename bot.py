@@ -11,38 +11,39 @@ import asyncio
 import requests
 
 # --------------------
-# Raruin Bot: Persistent DB block
-# Notes:
-# - Ensure your Render (or other host) mounts a persistent volume to /data
-#   and set DB_PATH to "/data/main.db" (or set via environment variable).
-# - If you leave DB_PATH pointing to a temporary path (e.g. /tmp or the
-#   project root in some PaaS), the DB will be lost on redeploy.
+# Raruin Bot: Persistent DB (GitHub Releases 方式)
 # --------------------
 
 # 環境変数読み込み
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# 永続 DB のパス（Render の Persistent Disk を /data にマウントする想定）
-# デフォルトを /data にしておくことで、deploy ごとに初期化される問題を防ぎます。
-DB_PATH = os.getenv("DB_PATH", "/data/main.db")
+# DB ファイルの保存パス（Render再起動時も保持されるよう /data に置くか、なければ root）
+DB_PATH = os.getenv("DB_PATH", "main.db")
 
-# 簡易チェック: DB_PATH が永続化フォルダになっているかを警告
+# 確認用警告
 def _warn_if_non_persistent_path(path: str):
     path = os.path.abspath(path)
-    # 以下の条件は一般的なヒューリスティックです。必要に応じて環境に合わせて調整してください。
-    ephemeral_indicators = ["/tmp", "\\\"", ":memory:"]
-    if any(ind in path for ind in ephemeral_indicators) or not path.startswith("/data"):
-        print(f"⚠️ 注意: DB_PATH({path}) が永続化フォルダ (/data) ではない可能性があります。\n   Render 等を使っている場合はマウント先を /data に設定し、DB_PATH を '/data/main.db' にしてください。")
+    if not path.startswith("/data") and not os.path.exists("/data"):
+        print(f"⚠️ 注意: DB_PATH({path}) は一時フォルダです。Render 再デプロイ時に失われる可能性があります。")
+        print("   → 今回は GitHub Releases 経由で永続化を行います。")
 
 _warn_if_non_persistent_path(DB_PATH)
 
-# 管理者（OWNER）のDiscord ID（必要に応じて変更）
+# 管理者（OWNER）のDiscord ID
 OWNER_ID = int(os.getenv("OWNER_ID", "1402613707527426131"))
 
-# バックアップ復元元（任意）と送信先チャンネル
-BACKUP_DB_URL = os.getenv("BACKUP_DB_URL", "")
+# バックアップ通知用チャンネル（任意）
 BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0") or 0)
+
+# ---------- 起動時：GitHub から最新 DB を取得 ----------
+try:
+    if download_latest_db():
+        print("✅ GitHub から最新の main.db をダウンロードしました。")
+    else:
+        print("⚠️ GitHub Releases に DB が見つかりません。新規に main.db を作成します。")
+except Exception as e:
+    print(f"⚠️ DB ダウンロード中にエラー: {e}")
 
 # ---------- Discord Bot 初期化 ----------
 intents = discord.Intents.default()
@@ -50,33 +51,16 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 tree = bot.tree
 
-# ----- 起動時: DB の格納ディレクトリがなければ作る -----
+# ---------- DB ディレクトリ作成 ----------
 try:
-    db_dir = os.path.dirname(DB_PATH) or "/"
+    db_dir = os.path.dirname(DB_PATH) or "."
     if db_dir and not os.path.exists(db_dir):
         os.makedirs(db_dir, exist_ok=True)
-        print(f"✅ DB ディレクトリを作成しました: {db_dir}")
+        print(f"✅ DB ディレクトリを作成: {db_dir}")
 except Exception as e:
-    print(f"⚠️ DB ディレクトリ作成に失敗: {e}")
+    print(f"⚠️ DB ディレクトリ作成失敗: {e}")
 
-# ----- 起動時: DB がなければ外部から復元を試みる（BACKUP_DB_URL が指定されている場合のみ） -----
-if not os.path.exists(DB_PATH):
-    if BACKUP_DB_URL:
-        try:
-            print(f"⚠️ DB({DB_PATH}) が見つかりません。バックアップURLから復元を試みます…")
-            r = requests.get(BACKUP_DB_URL, timeout=20)
-            r.raise_for_status()
-            with open(DB_PATH, "wb") as f:
-                f.write(r.content)
-            print(f"✅ DB を復元しました: {DB_PATH}")
-        except Exception as e:
-            print(f"❌ DB の復元に失敗しました: {e}  — 続行します（新規 DB を作成します）")
-    else:
-        print(f"ℹ️ DB が見つかりません: {DB_PATH} 。BACKUP_DB_URL が未設定のため新規 DB を作成します。")
-
-# --- SQLite 接続: グローバルに1つ保持（注意: check_same_thread=False を指定） ---
-# - Render などで /data にマウントしていれば、このファイルは再デプロイ間で保持されます。
-# - check_same_thread=False によって複数スレッドからのアクセスを許可しますが、トランザクション管理は注意して行ってください。
+# ---------- SQLite 接続 ----------
 try:
     conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -84,15 +68,14 @@ try:
     c = conn.cursor()
     print(f"✅ DB に接続しました: {DB_PATH}")
 except Exception as e:
-    print(f"[DB] 接続時にエラーが発生しました ({DB_PATH}): {e}")
+    print(f"[DB] 接続エラー: {e}")
     conn = None
     c = None
 
 # ---------- 必要なテーブルを自動作成 ----------
 if c:
     try:
-        # users（基本）
-        c.execute('''
+        c.executescript('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             balance INTEGER DEFAULT 0,
@@ -100,26 +83,17 @@ if c:
             total_spent INTEGER DEFAULT 0,
             daily_streak INTEGER DEFAULT 0,
             last_daily TEXT
-        )
-        ''')
+        );
 
-        # admins
-        c.execute('''
         CREATE TABLE IF NOT EXISTS admins (
             user_id INTEGER PRIMARY KEY
-        )
-        ''')
+        );
 
-        # shops
-        c.execute('''
         CREATE TABLE IF NOT EXISTS shops (
             shop_id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE
-        )
-        ''')
+        );
 
-        # shop_items
-        c.execute('''
         CREATE TABLE IF NOT EXISTS shop_items (
             item_id INTEGER PRIMARY KEY AUTOINCREMENT,
             shop_id INTEGER,
@@ -130,19 +104,13 @@ if c:
             role_id INTEGER,
             role_duration INTEGER,
             FOREIGN KEY (shop_id) REFERENCES shops(shop_id)
-        )
-        ''')
+        );
 
-        # gamble_settings
-        c.execute('''
         CREATE TABLE IF NOT EXISTS gamble_settings (
             id INTEGER PRIMARY KEY,
             probability_level INTEGER DEFAULT 3
-        )
-        ''')
+        );
 
-        # purchase_history
-        c.execute('''
         CREATE TABLE IF NOT EXISTS purchase_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -150,24 +118,16 @@ if c:
             item_name TEXT,
             price INTEGER,
             timestamp TEXT
-        )
+        );
         ''')
-
-        # 初期データ
         c.execute("INSERT OR IGNORE INTO gamble_settings (id, probability_level) VALUES (1, 3)")
-        try:
-            c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (OWNER_ID,))
-        except Exception:
-            pass
-
+        c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (OWNER_ID,))
         conn.commit()
-        print("✅ 必要なテーブルを作成/確認しました。")
+        print("✅ テーブル作成完了。")
     except Exception as e:
-        print(f"⚠️ テーブル作成時にエラー: {e}")
+        print(f"⚠️ テーブル作成中エラー: {e}")
 else:
-    print("⚠️ DBカーソルが利用できません。テーブル作成をスキップしました。")
-
-# ===== Discord Bot 設定（bot, tree は既に定義済み） =====
+    print("⚠️ DBカーソルが無効。")
 
 # ===== Flask keep_alive =====
 app = Flask(__name__)
@@ -176,42 +136,26 @@ app = Flask(__name__)
 def home():
     return "Raruin Bot Running!"
 
-
 def run_flask():
-    print("🌐 Flaskサーバー起動: ポート8080で待機中…")
     try:
-        # bind を 0.0.0.0 にして外部からの接続を許可（PaaS によっては不要）
-       import os
-port = int(os.getenv("PORT", "8080"))
-app.run(host='0.0.0.0', port=port)
-
+        port = int(os.getenv("PORT", "8080"))
+        app.run(host='0.0.0.0', port=port)
     except Exception as e:
         print(f"Flask 起動エラー: {e}")
 
 Thread(target=run_flask, daemon=True).start()
 
-# ---------- 定期バックアップタスク（定義のみ。開始は on_ready() で） ----------
+# ---------- GitHub Releases 自動バックアップタスク ----------
 @tasks.loop(hours=24)
 async def backup_database():
     try:
-        # チャンネル取得: get_channel が None を返す場合は fetch_channel を試す
-        channel = bot.get_channel(BACKUP_CHANNEL_ID)
-        if channel is None and BACKUP_CHANNEL_ID:
-            try:
-                channel = await bot.fetch_channel(BACKUP_CHANNEL_ID)
-            except Exception:
-                channel = None
+        upload_db_to_release()
+        print("✅ GitHub Releases に main.db をバックアップしました。")
 
-        if not channel:
-            print("⚠️ バックアップ: 指定されたチャンネルが見つかりません。送信をスキップします。")
-            return
-
-        if os.path.exists(DB_PATH):
-            # 送信は非同期 IO のまま行う
-            await channel.send(file=discord.File(DB_PATH))
-            print("✅ DB をバックアップチャンネルに送信しました。")
-        else:
-            print("⚠️ バックアップ: DB ファイルが見つかりません。送信をスキップします。")
+        if BACKUP_CHANNEL_ID:
+            channel = bot.get_channel(BACKUP_CHANNEL_ID)
+            if channel and os.path.exists(DB_PATH):
+                await channel.send(file=discord.File(DB_PATH))
     except Exception as e:
         print(f"[backup_database] エラー: {e}")
 
@@ -219,39 +163,28 @@ async def backup_database():
 async def before_backup():
     await bot.wait_until_ready()
 
-# ---------- on_ready でタスクを安全に開始 ----------
+# ---------- on_ready イベント ----------
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    print(f"Guilds: {[g.name for g in bot.guilds]}")
-    # コマンド同期
+    print(f"✅ ログイン完了: {bot.user}")
     try:
         await tree.sync()
+        print("✅ スラッシュコマンド同期済み。")
     except Exception as e:
-        print(f"[on_ready] tree.sync error: {e}")
+        print(f"⚠️ コマンド同期エラー: {e}")
 
-    # backup_database はここで安全に開始する（重複起動を防ぐ）
+    # 自動バックアップ起動
     try:
-        if BACKUP_CHANNEL_ID and not backup_database.is_running():
+        if not backup_database.is_running():
             backup_database.start()
-            print("backup_database task started.")
+            print("✅ 自動バックアップ開始。")
     except Exception as e:
         print(f"[on_ready] backup_database start error: {e}")
 
     print("Background tasks started.")
 
-# ===== 注意 =====
-# - Render 等の PaaS を使う場合は、上記 DB_PATH を /data/main.db に設定し、
-#   Render の "Persistent Disk" を /data にマウントしてください。
-# - local 開発時は .env に DB_PATH=/path/to/your/persistent/location/main.db を設定してください。
-# - BACKUP_DB_URL を使う場合は、公開アクセスできる URL を指定してください。
-
-# ===== (必要に応じて) bot.run を main 部分で呼んでください =====
-# if __name__ == '__main__':
-#     bot.run(TOKEN)
-
-
 # ---------- Part 2: 管理者コマンドと通貨操作 ----------
+
 
 # /addr - 管理者を追加・削除・一覧
 @tree.command(name="addr", description="管理者を追加、削除、一覧表示")
