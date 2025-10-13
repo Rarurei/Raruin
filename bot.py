@@ -437,15 +437,17 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
         return
 
     member_ids = [m.id for m in members]
-
     loop = asyncio.get_running_loop()
 
     def _add_balance_sync(member_ids, amt, db_path):
         conn = sqlite3.connect(db_path, timeout=30)
         cur = conn.cursor()
         # ユーザーを存在しなければ追加
-        cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids])
-        # 残高を加算
+        cur.executemany(
+            "INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?, 0, 0, 0)",
+            [(uid,) for uid in member_ids]
+        )
+        # 残高と累計受取を加算
         cur.executemany(
             "UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
             [(amt, amt, uid) for uid in member_ids]
@@ -484,11 +486,14 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
         conn = sqlite3.connect(db_path, timeout=30)
         cur = conn.cursor()
         # ユーザーを存在しなければ追加
-        cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids])
+        cur.executemany(
+            "INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?, 0, 0, 0)",
+            [(uid,) for uid in member_ids]
+        )
         # 残高を減算
         cur.executemany(
-            "UPDATE users SET balance = balance - ? WHERE user_id=?",
-            [(amt, uid) for uid in member_ids]
+            "UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?",
+            [(amt, amt, uid) for uid in member_ids]
         )
         conn.commit()
         conn.close()
@@ -910,33 +915,70 @@ async def transfer(interaction: discord.Interaction, target: discord.User, amoun
         print(f"[transfer] error: {e}")
         await interaction.response.send_message("⚠️ エラーが発生しました。")
 
-# 今日の収支
+# ---------- /今日の収支 ----------
 @tree.command(name="今日の収支", description="今日の収支を確認します")
 async def daily_profit(interaction: discord.Interaction):
-    user_id = interaction.user.id
-    conn = get_conn()
-    c = conn.cursor()
-    today = datetime.now().strftime("%Y-%m-%d")
-    c.execute("SELECT SUM(total_received - total_spent) FROM users WHERE user_id=? AND last_daily LIKE ?", (user_id, today+'%'))
-    row = c.fetchone()
-    profit = row[0] if row and row[0] else 0
-    conn.close()
-    await interaction.response.send_message(f"📊 今日の収支: {profit} Raruin")
+    try:
+        await interaction.response.defer(ephemeral=True)
+        loop = asyncio.get_running_loop()
 
-# リーダーボード
-@tree.command(name="リーダーボード", description="Raruin 残高ランキング")
+        def _get_daily_profit(uid, db_path):
+            conn = sqlite3.connect(db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            cur = conn.cursor()
+            today = datetime.now().strftime("%Y-%m-%d")
+            # 今日稼いだ総額と今日使った総額
+            cur.execute("""
+                SELECT SUM(total_received) as earned, SUM(total_spent) as spent
+                FROM users
+                WHERE user_id=? AND last_daily LIKE ?
+            """, (uid, today+'%'))
+            r = cur.fetchone()
+            conn.close()
+            earned = r[0] if r and r[0] else 0
+            spent = r[1] if r and r[1] else 0
+            return earned, spent
+
+        earned, spent = await loop.run_in_executor(None, _get_daily_profit, interaction.user.id, DB_PATH)
+
+        await interaction.followup.send(f"📊 今日の収支:\n稼いだ総額: {earned} Raruin\n使った総額: {spent} Raruin")
+    except Exception as e:
+        print(f"[daily_profit] error: {e}")
+        await interaction.followup.send("⚠️ エラーが発生しました。", ephemeral=True)
+
+# ---------- /リーダーボード ----------
+@tree.command(name="リーダーボード", description="累計の収支ランキング")
 async def leaderboard(interaction: discord.Interaction):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 10")
-    rows = c.fetchall()
-    conn.close()
-    msg = "🏆 Raruin リーダーボード\n"
-    for i, (uid, bal) in enumerate(rows, 1):
-        msg += f"{i}. <@{uid}> — {bal} Raruin\n"
-    await interaction.response.send_message(msg)
+    try:
+        await interaction.response.defer(ephemeral=False)
+        loop = asyncio.get_running_loop()
 
-        
+        def _get_leaderboard(db_path):
+            conn = sqlite3.connect(db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            cur = conn.cursor()
+            # 累計で稼いだ額 - 使った額 ではなく、ランキングとして稼いだ額と使った額を表示
+            cur.execute("""
+                SELECT user_id, total_received, total_spent
+                FROM users
+                ORDER BY total_received DESC
+                LIMIT 10
+            """)
+            rows = cur.fetchall()
+            conn.close()
+            return rows
+
+        rows = await loop.run_in_executor(None, _get_leaderboard, DB_PATH)
+
+        msg = "🏆 Raruin リーダーボード (累計)\n"
+        for i, (uid, earned, spent) in enumerate(rows, 1):
+            msg += f"{i}. <@{uid}> — 稼いだ総額: {earned} Raruin | 使った総額: {spent} Raruin\n"
+
+        await interaction.followup.send(msg)
+    except Exception as e:
+        print(f"[leaderboard] error: {e}")
+        await interaction.followup.send("⚠️ エラーが発生しました。")
+
 # ---------- /ヘルプ ----------
 @tree.command(name="ヘルプ", description="Botの全コマンド一覧を表示します")
 async def help_cmd(interaction: discord.Interaction):
