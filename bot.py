@@ -439,15 +439,16 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
     member_ids = [m.id for m in members]
     loop = asyncio.get_running_loop()
 
-    def _add_balance_sync(member_ids, amt, db_path):
+    def _add_balance_batch(member_ids, amt, db_path):
         conn = sqlite3.connect(db_path, timeout=30)
         cur = conn.cursor()
-        # ユーザーを存在しなければ追加
+        conn.execute("PRAGMA journal_mode=WAL;")
+        # ユーザーをまとめて追加
         cur.executemany(
             "INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?, 0, 0, 0)",
             [(uid,) for uid in member_ids]
         )
-        # 残高と累計受取を加算
+        # 残高と累計受取をまとめて更新
         cur.executemany(
             "UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
             [(amt, amt, uid) for uid in member_ids]
@@ -455,7 +456,7 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
         conn.commit()
         conn.close()
 
-    await loop.run_in_executor(None, _add_balance_sync, member_ids, amount, DB_PATH)
+    await loop.run_in_executor(None, _add_balance_batch, member_ids, amount, DB_PATH)
 
     target_name = members[0].display_name if len(members) == 1 else f"{len(members)}人のメンバー"
     await interaction.followup.send(f"🎁 {target_name} に **{amount:,} Raruin** を付与しました。")
@@ -482,15 +483,16 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
     member_ids = [m.id for m in members]
     loop = asyncio.get_running_loop()
 
-    def _subtract_balance_sync(member_ids, amt, db_path):
+    def _subtract_balance_batch(member_ids, amt, db_path):
         conn = sqlite3.connect(db_path, timeout=30)
         cur = conn.cursor()
-        # ユーザーを存在しなければ追加
+        conn.execute("PRAGMA journal_mode=WAL;")
+        # ユーザーをまとめて追加
         cur.executemany(
             "INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?, 0, 0, 0)",
             [(uid,) for uid in member_ids]
         )
-        # 残高を減算
+        # 残高を減算し累計支出を加算
         cur.executemany(
             "UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?",
             [(amt, amt, uid) for uid in member_ids]
@@ -498,11 +500,10 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
         conn.commit()
         conn.close()
 
-    await loop.run_in_executor(None, _subtract_balance_sync, member_ids, amount, DB_PATH)
+    await loop.run_in_executor(None, _subtract_balance_batch, member_ids, amount, DB_PATH)
 
     target_name = members[0].display_name if len(members) == 1 else f"{len(members)}人のメンバー"
     await interaction.followup.send(f"💸 {target_name} から **{amount:,} Raruin** を減算しました。")
-
 
 
 
