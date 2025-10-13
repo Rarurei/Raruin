@@ -402,113 +402,77 @@ def _find_role_from_input(raw: str, guild: discord.Guild) -> Optional[discord.Ro
     return role
 
 
-# ---------- /配布（付与）（修正版：ロール存在チェックとDB安全化含む） ----------
-@tree.command(name="配布", description="指定したユーザーやロールにRaruinを付与（管理者専用）")
-@app_commands.describe(target="ユーザー（@で指定可）またはロール名/ID/ユーザー名", amount="付与額")
+# --------------------
+# /配布
+# --------------------
+@tree.command(name="配布", description="指定したユーザーまたはロールにRaruinを付与（管理者専用）")
+@app_commands.describe(target="ユーザーまたはロール", amount="付与する金額")
 async def distribute(interaction: discord.Interaction, target: str, amount: int):
-    if not is_admin(interaction.user.id):
+    if not await is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
         return
-
     if amount <= 0:
         await interaction.response.send_message("⚠️ 付与額は1以上にしてください。", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True)
 
     members = await resolve_target_members(target, interaction)
-
-    # members が空なら、改めて「ロールとして存在するか」をチェックしてユーザ向けメッセージを出す
     if not members:
-        # guild が存在するか確認
-        guild = interaction.guild
-        if guild:
-            role_obj = _find_role_from_input(target, guild)
-            if role_obj:
-                # ロールは見つかったがメンバー0 のケース
-                if len(role_obj.members) == 0:
-                    await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
-                    return
-                # ロールにはメンバーがいる（resolve が失敗していた可能性） -> そのメンバーを使う
-                members = role_obj.members
-
-    if not members:
-        await interaction.response.send_message("❌ 対象が見つかりませんでした。@メンション / ID / ロール名 / ユーザー名 を試してください。", ephemeral=True)
+        await interaction.followup.send("❌ 対象ユーザーが見つかりません。", ephemeral=True)
         return
 
-    conn = sqlite3.connect("main.db", timeout=10)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            balance INTEGER DEFAULT 0,
-            total_received INTEGER DEFAULT 0,
-            total_spent INTEGER DEFAULT 0
-        )
-    """)
-    for m in members:
-        cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (m.id,))
-        cur.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?", (amount, amount, m.id))
-    conn.commit()
-    conn.close()
+    def _add_balance_sync(member_ids, amt, db_path):
+        conn = sqlite3.connect(db_path, timeout=30)
+        cur = conn.cursor()
+        cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids])
+        cur.executemany("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
+                        [(amt, amt, uid) for uid in member_ids])
+        conn.commit()
+        conn.close()
 
-    if len(members) == 1:
-        name = members[0].display_name
-    else:
-        name = f"{len(members)} 件のメンバー"
-    await interaction.response.send_message(f"🎁 {name} に {amount} Raruin を付与しました。")
+    member_ids = [m.id for m in members]
+    await db.execute(_add_balance_sync, member_ids, amount, DB_PATH)
 
+    target_name = members[0].display_name if len(members) == 1 else f"{len(members)}人のメンバー"
+    await interaction.followup.send(f"🎁 {target_name} に **{amount:,} Raruin** を付与しました。")
 
-# ---------- /支払い（減算）（修正版：ロール存在チェックとDB安全化含む） ----------
-@tree.command(name="支払い", description="指定したユーザーやロールのRaruinを減らす（管理者専用）")
-@app_commands.describe(target="ユーザー（@で指定可）またはロール名/ID/ユーザー名", amount="減らす額")
+# --------------------
+# /支払い
+# --------------------
+@tree.command(name="支払い", description="指定したユーザーまたはロールのRaruinを減らす（管理者専用）")
+@app_commands.describe(target="ユーザーまたはロール", amount="減算する金額")
 async def payment(interaction: discord.Interaction, target: str, amount: int):
-    if not is_admin(interaction.user.id):
+    if not await is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
         return
-
     if amount <= 0:
         await interaction.response.send_message("⚠️ 減算額は1以上にしてください。", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True)
 
     members = await resolve_target_members(target, interaction)
-
-    # members が空ならロール存在チェック（改善）
     if not members:
-        guild = interaction.guild
-        if guild:
-            role_obj = _find_role_from_input(target, guild)
-            if role_obj:
-                if len(role_obj.members) == 0:
-                    await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
-                    return
-                members = role_obj.members
-
-    if not members:
-        await interaction.response.send_message("❌ 対象が見つかりませんでした。@メンション / ID / ロール名 / ユーザー名 を試してください。", ephemeral=True)
+        await interaction.followup.send("❌ 対象ユーザーが見つかりません。", ephemeral=True)
         return
 
-    # DB処理（安全に）
-    conn = sqlite3.connect("main.db", timeout=10)
+def _subtract_balance_sync(member_ids, amt, db_path):
+    conn = sqlite3.connect(db_path, timeout=30)
     cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            balance INTEGER DEFAULT 0,
-            total_received INTEGER DEFAULT 0,
-            total_spent INTEGER DEFAULT 0
-        )
-    """)
-    for m in members:
-        cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (m.id,))
-        cur.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?", (amount, amount, m.id))
+    
+    # ユーザーを存在しなければ追加
+    cur.executemany(
+        "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
+        [(member_id,) for member_id in member_ids]
+    )
+
+    # 残高を減算
+    cur.executemany(
+        "UPDATE users SET balance = balance - ? WHERE user_id = ?",
+        [(amt, member_id) for member_id in member_ids]
+    )
+
     conn.commit()
     conn.close()
-
-    # レスポンス
-    if len(members) == 1:
-        name = members[0].display_name
-    else:
-        name = f"{len(members)} 件のメンバー"
-    await interaction.response.send_message(f"💸 {name} から {amount} Raruin を減算しました。")
 
 
 
