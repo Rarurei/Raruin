@@ -470,10 +470,25 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
         await interaction.followup.send("❌ 対象ユーザーが見つかりません。", ephemeral=True)
         return
 
-    def _subtract_balance_sync(member_ids, amt, db_path):
-        conn = sqlite3.connect(db_path, timeout=30)
-        cur = conn.cursor()
-        cur.executemany("INSERT OR IGNORE INTO users (user_id
+def _subtract_balance_sync(member_ids, amt, db_path):
+    conn = sqlite3.connect(db_path, timeout=30)
+    cur = conn.cursor()
+    
+    # ユーザーを存在しなければ追加
+    cur.executemany(
+        "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
+        [(member_id,) for member_id in member_ids]
+    )
+
+    # 残高を減算
+    cur.executemany(
+        "UPDATE users SET balance = balance - ? WHERE user_id = ?",
+        [(amt, member_id) for member_id in member_ids]
+    )
+
+    conn.commit()
+    conn.close()
+
 
 
 
