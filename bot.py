@@ -256,27 +256,22 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
 
     await interaction.response.defer(ephemeral=True)
 
-    async def _add_balance(member_ids, amt):
-        conn = sqlite3.connect(DB_PATH)
+    def _add_balance(member_ids, amt):
+        conn = db._connect()
         cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                balance INTEGER DEFAULT 0,
-                total_received INTEGER DEFAULT 0,
-                total_spent INTEGER DEFAULT 0
-            )
-        """)
         for uid in member_ids:
             cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
-            cur.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?", (amt, amt, uid))
+            cur.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
+                        (amt, amt, uid))
         conn.commit()
         conn.close()
 
     member_ids = [m.id for m in members]
     await db.execute(_add_balance, member_ids, amount)
-    name = members[0].display_name if len(members)==1 else f"{len(members)} 件のメンバー"
+
+    name = members[0].display_name if len(members) == 1 else f"{len(members)} 件のメンバー"
     await interaction.followup.send(f"🎁 {name} に {amount} Raruin を付与しました。")
+
 
 # ---------- /支払い ----------
 @tree.command(name="支払い", description="指定したユーザーやロールのRaruinを減らす（管理者専用）")
@@ -303,28 +298,21 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
 
     await interaction.response.defer(ephemeral=True)
 
-    async def _subtract_balance(member_ids, amt):
-        conn = sqlite3.connect(DB_PATH)
+    def _subtract_balance(member_ids, amt):
+        conn = db._connect()
         cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                balance INTEGER DEFAULT 0,
-                total_received INTEGER DEFAULT 0,
-                total_spent INTEGER DEFAULT 0
-            )
-        """)
         for uid in member_ids:
             cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
-            cur.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?", (amt, amt, uid))
+            cur.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?",
+                        (amt, amt, uid))
         conn.commit()
         conn.close()
 
     member_ids = [m.id for m in members]
     await db.execute(_subtract_balance, member_ids, amount)
-    name = members[0].display_name if len(members)==1 else f"{len(members)} 件のメンバー"
-    await interaction.followup.send(f"💸 {name} から {amount} Raruin を減算しました。")
 
+    name = members[0].display_name if len(members) == 1 else f"{len(members)} 件のメンバー"
+    await interaction.followup.send(f"💸 {name} から {amount} Raruin を減算しました。")
 # ---------- /ギャンブル確率設定 ----------
 @tree.command(name="ギャンブル確率設定", description="管理者専用: ギャンブル確率レベル変更")
 @app_commands.describe(probability="1=当たりやすい, 6=当たりにくい")
