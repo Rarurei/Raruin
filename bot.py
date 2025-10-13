@@ -8,7 +8,6 @@ from flask import Flask
 from threading import Thread
 from github_backup import download_latest_db, upload_db_to_release
 import asyncio
-import requests
 
 # --------------------
 # PersistentDB ラッパー
@@ -16,7 +15,10 @@ import requests
 class PersistentDB:
     def __init__(self, db_path: str):
         self.db_path = db_path
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        # ディレクトリが空文字でなければ作成
+        db_dir = os.path.dirname(db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
         self._warn_if_non_persistent_path()
         self._ensure_tables()
 
@@ -122,12 +124,14 @@ app = Flask(__name__)
 @app.route('/')
 def home():
     return "Raruin Bot Running!"
+
 def run_flask():
     try:
         port = int(os.getenv("PORT", "8080"))
         app.run(host='0.0.0.0', port=port)
     except Exception as e:
         print(f"Flask 起動エラー: {e}")
+
 Thread(target=run_flask, daemon=True).start()
 
 # ---------- GitHub Releases 自動バックアップタスク ----------
@@ -136,9 +140,9 @@ async def backup_database():
     try:
         upload_db_to_release()
         print("✅ GitHub Releases に main.db をバックアップしました。")
-        if BACKUP_CHANNEL_ID:
+        if BACKUP_CHANNEL_ID and os.path.exists(DB_PATH):
             channel = bot.get_channel(BACKUP_CHANNEL_ID)
-            if channel and os.path.exists(DB_PATH):
+            if channel:
                 await channel.send(file=discord.File(DB_PATH))
     except Exception as e:
         print(f"[backup_database] エラー: {e}")
