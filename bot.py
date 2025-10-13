@@ -12,19 +12,16 @@ from typing import List, Optional
 import re
 import requests
 import atexit
-import time
-import json
 
 # --------------------
 # .env読み込みと初期設定
 # --------------------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "1402613707426131"))
+OWNER_ID = int(os.getenv("OWNER_ID", "1402613707527426131"))
 
-# GitHub / backup 設定（Render の Environment Variables に設定しておく）
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO = os.getenv("GITHUB_REPO")  # ex: "YourUser/YourRepo"
+GITHUB_REPO = os.getenv("GITHUB_REPO")
 BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0") or 0)
 
 if not TOKEN:
@@ -45,7 +42,6 @@ def run_flask():
     except:
         port = 8080
     try:
-        # Flask をデーモンスレッドで起動（失敗しても Bot を止めない）
         app.run(host="0.0.0.0", port=port)
     except Exception as e:
         print(f"[Flask] 起動エラー: {e}")
@@ -64,14 +60,12 @@ tree = bot.tree
 # --------------------
 # DB_PATH の決定とディレクトリ作成
 # --------------------
-# 優先順位: 環境変数 DB_PATH -> /data/main.db (存在すれば) -> ./main.db
 _env_db = os.getenv("DB_PATH")
 if _env_db:
     DB_PATH = _env_db
 else:
     DB_PATH = "/data/main.db" if os.path.exists("/data") else "main.db"
 
-# Ensure containing directory exists (try to create; permission-safe)
 db_dir = os.path.dirname(os.path.abspath(DB_PATH)) or "."
 if db_dir and not os.path.exists(db_dir):
     try:
@@ -81,10 +75,7 @@ if db_dir and not os.path.exists(db_dir):
         print(f"⚠️ DBディレクトリ作成失敗: {db_dir} ({e})")
 
 # --------------------
-# GitHub Backup ヘルパー（同期関数）
-#   - download_latest_db() : 起動時に Releases から main.db を取得（存在すれば）
-#   - upload_db_to_release() : 現在の DB を Releases にアップロード（古い tag を削除して置換）
-# ※ GITHUB_TOKEN と GITHUB_REPO が必要（環境変数に設定）
+# GitHub Backup ヘルパー
 # --------------------
 RELEASE_TAG = "db-backup-automated"
 ASSET_NAME = os.path.basename(DB_PATH) or "main.db"
@@ -105,7 +96,6 @@ def _get_releases():
     return r.json()
 
 def download_latest_db():
-    """GitHub Releases から最新の DB アセットをダウンロード（存在すれば）。同期処理。"""
     try:
         if not GITHUB_REPO or not GITHUB_TOKEN:
             print("ℹ️ GitHub 情報が未設定のためダウンロードはスキップします。")
@@ -114,7 +104,6 @@ def download_latest_db():
         if not releases:
             print("ℹ️ Release が見つかりません。")
             return False
-        # 最新リリースから .db アセットを探す
         for rel in releases:
             assets = rel.get("assets", [])
             for a in assets:
@@ -139,13 +128,11 @@ def download_latest_db():
         return False
 
 def upload_db_to_release():
-    """現在の DB を GitHub Release にアップロード（同期・ブロッキング）。"""
     try:
         if not GITHUB_REPO or not GITHUB_TOKEN:
             print("ℹ️ GitHub 情報が未設定のためアップロードをスキップします。")
             return False
 
-        # 先に既存の同タグリリースを削除（あれば）
         releases = _get_releases()
         if releases is None:
             print("⚠️ GitHub Releases を取得できませんでした（アップロード中止）。")
@@ -165,7 +152,6 @@ def upload_db_to_release():
             else:
                 print(f"⚠️ 既存リリース削除に失敗: {rdel.status_code} {rdel.text[:200]}")
 
-        # 新しいリリース作成
         create_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
         payload = {
             "tag_name": RELEASE_TAG,
@@ -183,7 +169,6 @@ def upload_db_to_release():
             print("⚠️ upload_url が取得できませんでした。")
             return False
 
-        # アセットアップロード
         with open(DB_PATH, "rb") as fh:
             params = {"name": ASSET_NAME}
             headers = {"Authorization": f"token {GITHUB_TOKEN}", "Content-Type": "application/octet-stream"}
@@ -199,7 +184,6 @@ def upload_db_to_release():
         print(f"[upload_db_to_release] エラー: {e}")
         return False
 
-# ensure upload on process exit (best-effort synchronous)
 def _atexit_upload():
     try:
         print("🟡 プロセス終了: GitHub に DB をアップロードします（best-effort）...")
@@ -210,11 +194,10 @@ def _atexit_upload():
 atexit.register(_atexit_upload)
 
 # --------------------
-# PersistentDB クラス（Render永続化対応）
+# PersistentDB クラス
 # --------------------
 class PersistentDB:
     def __init__(self, db_path: str):
-        # env に与えた db_path があればそちらを優先（上で決定済み DB_PATH を使う）
         self.db_path = db_path
         self._warn_if_non_persistent_path()
         self._ensure_tables()
@@ -223,7 +206,6 @@ class PersistentDB:
         path = os.path.abspath(self.db_path)
         if not path.startswith("/data"):
             print(f"⚠️ 注意: DB_PATH({path}) は永続化されない可能性があります。")
-            print("   → GitHub Releases でのバックアップを推奨します。")
 
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
@@ -295,9 +277,8 @@ class PersistentDB:
         return await loop.run_in_executor(None, func, *args, **kwargs)
 
 # --------------------
-# 起動時: GitHub から DB を取得（あれば）してから PersistentDB 初期化
+# DB ダウンロード
 # --------------------
-# ダウンロードは best-effort（無ければローカル新規作成）
 try:
     downloaded = download_latest_db()
     if downloaded:
@@ -307,21 +288,18 @@ try:
 except Exception as e:
     print(f"⚠️ 起動時 DB ダウンロード中にエラー: {e}")
 
-# 実際の DB オブジェクト
 db = PersistentDB(DB_PATH)
 
 # --------------------
-# 自動バックアップタスク（定期的に GitHub にアップロード）
+# 自動バックアップタスク
 # --------------------
 @tasks.loop(hours=6)
 async def auto_backup_task():
     try:
         await bot.wait_until_ready()
-        # run upload in thread to avoid blocking event loop
         result = await asyncio.to_thread(upload_db_to_release)
         if result:
             print("✅ 自動バックアップ成功（GitHub）。")
-            # optional: send to backup channel if configured
             try:
                 if BACKUP_CHANNEL_ID:
                     ch = bot.get_channel(BACKUP_CHANNEL_ID)
@@ -338,16 +316,15 @@ async def auto_backup_task():
 async def before_auto_backup():
     await bot.wait_until_ready()
 
-# start the task when bot is ready (we'll start it in on_ready)
 # --------------------
-# ユーザー関連関数
+# ユーザー残高関連
 # --------------------
 def add_user_if_not_exists_sync(user_id: int):
     conn = None
     try:
         conn = db._connect()
         cur = conn.cursor()
-        cur.execute("INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?, 0, 0, 0)", (user_id,))
+        cur.execute("INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?,0,0,0)", (user_id,))
         conn.commit()
     except Exception as e:
         print(f"[add_user_if_not_exists_sync] エラー: {e}")
@@ -381,7 +358,7 @@ def update_balance_sync(user_id: int, amount: int):
     try:
         conn = db._connect()
         cur = conn.cursor()
-        cur.execute("INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?, 0, 0, 0)", (user_id,))
+        cur.execute("INSERT OR IGNORE INTO users (user_id, balance, total_received, total_spent) VALUES (?,0,0,0)", (user_id,))
         if amount >= 0:
             cur.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?", (amount, amount, user_id))
         else:
@@ -397,133 +374,8 @@ async def update_balance(user_id: int, amount: int):
     await asyncio.to_thread(update_balance_sync, user_id, amount)
 
 # --------------------
-# 最後に: on_ready で自動バックアップタスクを開始する（ここは既存の on_ready に組み込んでください）
+# 管理者チェック
 # --------------------
-# --------------------
-# 最後に: on_ready で自動バックアップタスクを開始する（ここは既存の on_ready に組み込んでください）
-# --------------------
-@bot.event
-async def on_ready():
-    try:
-        print("===================================================")
-        print("✅ ログイン完了:", bot.user)
-        print("ID:", bot.user.id)
-        print("日時:", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S (UTC)"))
-        print("DB path:", DB_PATH)
-        print("Owner ID:", OWNER_ID)
-        print("===================================================")
-    except Exception:
-        pass
-
-    try:
-        await tree.sync()
-        print("✅ スラッシュコマンドを同期しました。")
-    except Exception as e:
-        print(f"⚠️ スラッシュコマンド同期エラー: {e}")
-
-    # start backup loop if not running
-    try:
-        if not auto_backup_task.is_running():
-            auto_backup_task.start()
-            print("✅ 自動バックアップタスクを開始しました（6時間毎）。")
-    except Exception as e:
-        print(f"[on_ready] auto_backup_task start error: {e}")
-
-    print("Bot is ready.")
-
-# --- end of section ---
-
-
-# ===================================================
-# 🔁 旧コード互換用関数（古い構文で呼ばれても落ちないようにする）
-# ===================================================
-def _add_user_if_not_exists_sync(user_id: int):
-    """
-    古いコードで `_add_user_if_not_exists_sync` を呼び出しても落ちないようにする互換用関数。
-    内部で `add_user_if_not_exists` を呼び出します。
-    """
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # Bot のイベントループがすでに動いている場合
-            asyncio.create_task(add_user_if_not_exists(user_id))
-        else:
-            loop.run_until_complete(add_user_if_not_exists(user_id))
-    except RuntimeError:
-        # ループが存在しない場合は新しく作って実行
-        asyncio.run(add_user_if_not_exists(user_id))
-    except Exception as e:
-        print(f"[旧互換 _add_user_if_not_exists_sync] エラー: {e}")
-
-
-
-# ---------- /addr - 管理者追加・削除・一覧 ----------
-@tree.command(name="addr", description="管理者を追加、削除、一覧表示")
-@app_commands.describe(action="add, remove, list", target="ユーザー名またはID")
-async def addr(interaction: discord.Interaction, action: str, target: str = None):
-    try:
-        # ensure caller exists in users table
-        await db.execute(_add_user_if_not_exists_sync, interaction.user.id, DB_PATH)
-
-        if not await is_admin(interaction.user.id):
-            await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
-            return
-
-        action = action.lower()
-        if action == "list":
-            def _fetch_admins():
-                conn = sqlite3.connect(DB_PATH)
-                cur = conn.cursor()
-                cur.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)")
-                cur.execute("SELECT user_id FROM admins")
-                rows = cur.fetchall()
-                conn.close()
-                return rows
-
-            rows = await db.execute(_fetch_admins)
-            if not rows:
-                await interaction.response.send_message("👤 管理者はまだ登録されていません。")
-                return
-            mentions = [f"<@{uid[0]}>" for uid in rows]
-            await interaction.response.send_message(f"👑 管理者一覧: {', '.join(mentions)}")
-            return
-
-        if not target:
-            await interaction.response.send_message("⚠️ 対象ユーザー名またはIDを指定してください。", ephemeral=True)
-            return
-
-        # 解決: ギルドメンバー名 or ID で探す
-        user = None
-        if interaction.guild:
-            user = discord.utils.find(lambda m: m.name == target or (m.nick and m.nick == target), interaction.guild.members)
-        if not user:
-            try:
-                user_id = int(target)
-                user = await bot.fetch_user(user_id)
-            except:
-                await interaction.response.send_message("❌ ユーザーが見つかりません。", ephemeral=True)
-                return
-
-        async def _modify_admins(action_inner, uid):
-            conn = sqlite3.connect(DB_PATH)
-            cur = conn.cursor()
-            cur.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)")
-            if action_inner == "add":
-                cur.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (uid,))
-            elif action_inner == "remove":
-                cur.execute("DELETE FROM admins WHERE user_id=?", (uid,))
-            conn.commit()
-            conn.close()
-
-        await db.execute(_modify_admins, action, user.id)
-        msg = f"✅ {user.mention} を管理者に追加しました。" if action == "add" else f"🗑️ {user.mention} を管理者から削除しました。"
-        await interaction.response.send_message(msg)
-    except Exception as e:
-        print(f"[addr] error: {e}")
-        await interaction.response.send_message(f"⚠️ エラーが発生しました: {e}", ephemeral=True)
-
-
-# ---------- 管理者チェック（非同期ラッパー） ----------
 async def is_admin(user_id: int) -> bool:
     def _check():
         conn = sqlite3.connect(DB_PATH)
@@ -540,190 +392,89 @@ async def is_admin(user_id: int) -> bool:
         print(f"[is_admin] DB error: {e}")
         return user_id == OWNER_ID
 
+# --------------------
+# on_ready
+# --------------------
+@bot.event
+async def on_ready():
+    print("===================================================")
+    print("✅ ログイン完了:", bot.user)
+    print("ID:", bot.user.id)
+    print("日時:", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S (UTC)"))
+    print("DB path:", DB_PATH)
+    print("Owner ID:", OWNER_ID)
+    print("===================================================")
+    try:
+        await tree.sync()
+        print("✅ スラッシュコマンドを同期しました。")
+    except Exception as e:
+        print(f"⚠️ スラッシュコマンド同期エラー: {e}")
+    try:
+        if not auto_backup_task.is_running():
+            auto_backup_task.start()
+            print("✅ 自動バックアップタスクを開始しました（6時間毎）。")
+    except Exception as e:
+        print(f"[on_ready] auto_backup_task start error: {e}")
+    print("Bot is ready.")
 
-# ---------- ターゲット解決（より堅牢） ----------
-async def resolve_target_members(target: str, interaction: discord.Interaction) -> List[discord.Member]:
-    guild = interaction.guild
-    if not guild:
-        return []
-
-    raw = target.strip()
-
-    # role mention <@&id>
-    m = re.match(r'^<@&(\d+)>$', raw)
-    if m:
-        role = guild.get_role(int(m.group(1)))
-        return list(role.members) if role else []
-
-    # user mention <@!id> or <@id>
-    m = re.match(r'^<@!?(?P<id>\d+)>$', raw)
-    if m:
-        uid = int(m.group("id"))
-        member = guild.get_member(uid)
-        if not member:
-            try:
-                member = await guild.fetch_member(uid)
-            except:
-                member = None
-        return [member] if member else []
-
-    # if starts with @name (fuzzy role)
-    if raw.startswith("@") or raw.startswith("＠"):
-        name = raw.lstrip("@\uFF20").strip()
-        role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
-        if role:
-            return list(role.members)
-        starts = [r for r in guild.roles if r.name.lower().startswith(name.lower())]
-        if starts:
-            return list(starts[0].members)
-        contains = [r for r in guild.roles if name.lower() in r.name.lower()]
-        if contains:
-            return list(contains[0].members)
-        return []
-
-    # digits -> id (member or role)
-    if raw.isdigit():
-        uid = int(raw)
-        member = guild.get_member(uid)
-        if not member:
-            try:
-                member = await guild.fetch_member(uid)
-            except:
-                member = None
-        if member:
-            return [member]
-        role = guild.get_role(uid)
-        if role:
-            return list(role.members)
-
-    # direct member name / nickname
-    found = []
-    for mbr in guild.members:
-        if mbr.name == raw or (mbr.nick and mbr.nick == raw) or f"{mbr.name}#{mbr.discriminator}" == raw:
-            found.append(mbr)
-    if found:
-        return found[:50]
-
-    # partial match
-    partial = [mbr for mbr in guild.members if raw.lower() in mbr.name.lower() or (mbr.nick and raw.lower() in mbr.nick.lower())]
-    return partial[:50]
-
-
-def _find_role_from_input(raw: str, guild: discord.Guild) -> Optional[discord.Role]:
-    if not guild:
-        return None
-    s = raw.strip()
-    m = re.match(r'^<@&(\d+)>$', s)
-    if m:
-        return guild.get_role(int(m.group(1)))
-    if s.isdigit():
-        r = guild.get_role(int(s))
-        if r:
-            return r
-    name = s.lstrip("@\uFF20").strip()
-    if name:
-        role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
-        if role:
-            return role
-        starts = [r for r in guild.roles if r.name.lower().startswith(name.lower())]
-        if starts:
-            return starts[0]
-        contains = [r for r in guild.roles if name.lower() in r.name.lower()]
-        if contains:
-            return contains[0]
-    role = discord.utils.find(lambda r: r.name.lower() == s.lower(), guild.roles)
-    return role
-
-
-# ---------- /配布 ----------
+# --------------------
+# /配布
+# --------------------
 @tree.command(name="配布", description="指定したユーザーまたはロールにRaruinを付与（管理者専用）")
-@app_commands.describe(target="ユーザーまたはロール（@メンション可）", amount="付与する金額")
+@app_commands.describe(target="ユーザーまたはロール", amount="付与する金額")
 async def distribute(interaction: discord.Interaction, target: str, amount: int):
-    try:
-        if not await is_admin(interaction.user.id):
-            await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
-            return
-        if amount <= 0:
-            await interaction.response.send_message("⚠️ 付与額は1以上にしてください。", ephemeral=True)
-            return
+    if not await is_admin(interaction.user.id):
+        await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
+        return
+    if amount <= 0:
+        await interaction.response.send_message("⚠️ 付与額は1以上にしてください。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
 
-        # Defer early to avoid "application did not respond"
-        await interaction.response.defer(ephemeral=True)
+    members = await resolve_target_members(target, interaction)
+    if not members:
+        await interaction.followup.send("❌ 対象ユーザーが見つかりません。", ephemeral=True)
+        return
 
-        members = await resolve_target_members(target, interaction)
-        if not members:
-            role_obj = _find_role_from_input(target, interaction.guild)
-            if role_obj:
-                members = list(role_obj.members)
-        if not members:
-            await interaction.followup.send("❌ 対象ユーザーまたはロールが見つかりません。", ephemeral=True)
-            return
+    def _add_balance_sync(member_ids, amt, db_path):
+        conn = sqlite3.connect(db_path, timeout=30)
+        cur = conn.cursor()
+        cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids])
+        cur.executemany("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
+                        [(amt, amt, uid) for uid in member_ids])
+        conn.commit()
+        conn.close()
 
-        def _add_balance_sync(member_ids, amt, db_path):
-            conn = sqlite3.connect(db_path, timeout=30)
-            cur = conn.cursor()
-            cur.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 0, total_received INTEGER DEFAULT 0, total_spent INTEGER DEFAULT 0)")
-            cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids])
-            cur.executemany("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?", [(amt, amt, uid) for uid in member_ids])
-            conn.commit()
-            conn.close()
+    member_ids = [m.id for m in members]
+    await db.execute(_add_balance_sync, member_ids, amount, DB_PATH)
 
-        member_ids = [m.id for m in members]
-        await db.execute(_add_balance_sync, member_ids, amount, DB_PATH)
+    target_name = members[0].display_name if len(members) == 1 else f"{len(members)}人のメンバー"
+    await interaction.followup.send(f"🎁 {target_name} に **{amount:,} Raruin** を付与しました。")
 
-        target_name = members[0].display_name if len(members) == 1 else f"{len(members)}人のメンバー"
-        await interaction.followup.send(f"🎁 {target_name} に **{amount:,} Raruin** を付与しました。")
-    except Exception as e:
-        print(f"[distribute] error: {e}")
-        try:
-            await interaction.followup.send(f"⚠️ エラーが発生しました: {e}", ephemeral=True)
-        except:
-            pass
-
-
-# ---------- /支払い ----------
+# --------------------
+# /支払い
+# --------------------
 @tree.command(name="支払い", description="指定したユーザーまたはロールのRaruinを減らす（管理者専用）")
-@app_commands.describe(target="ユーザーまたはロール（@メンション可）", amount="減算する金額")
+@app_commands.describe(target="ユーザーまたはロール", amount="減算する金額")
 async def payment(interaction: discord.Interaction, target: str, amount: int):
-    try:
-        if not await is_admin(interaction.user.id):
-            await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
-            return
-        if amount <= 0:
-            await interaction.response.send_message("⚠️ 減算額は1以上にしてください。", ephemeral=True)
-            return
+    if not await is_admin(interaction.user.id):
+        await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
+        return
+    if amount <= 0:
+        await interaction.response.send_message("⚠️ 減算額は1以上にしてください。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
 
-        await interaction.response.defer(ephemeral=True)
+    members = await resolve_target_members(target, interaction)
+    if not members:
+        await interaction.followup.send("❌ 対象ユーザーが見つかりません。", ephemeral=True)
+        return
 
-        members = await resolve_target_members(target, interaction)
-        if not members:
-            role_obj = _find_role_from_input(target, interaction.guild)
-            if role_obj:
-                members = list(role_obj.members)
-        if not members:
-            await interaction.followup.send("❌ 対象ユーザーまたはロールが見つかりません。", ephemeral=True)
-            return
+    def _subtract_balance_sync(member_ids, amt, db_path):
+        conn = sqlite3.connect(db_path, timeout=30)
+        cur = conn.cursor()
+        cur.executemany("INSERT OR IGNORE INTO users (user_id
 
-        def _subtract_balance_sync(member_ids, amt, db_path):
-            conn = sqlite3.connect(db_path, timeout=30)
-            cur = conn.cursor()
-            cur.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 0, total_received INTEGER DEFAULT 0, total_spent INTEGER DEFAULT 0)")
-            cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids])
-            cur.executemany("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?", [(amt, amt, uid) for uid in member_ids])
-            conn.commit()
-            conn.close()
-
-        member_ids = [m.id for m in members]
-        await db.execute(_subtract_balance_sync, member_ids, amount, DB_PATH)
-
-        target_name = members[0].display_name if len(members) == 1 else f"{len(members)}人のメンバー"
-        await interaction.followup.send(f"💸 {target_name} から **{amount:,} Raruin** を減算しました。")
-    except Exception as e:
-        print(f"[payment] error: {e}")
-        try:
-            await interaction.followup.send(f"⚠️ エラーが発生しました: {e}", ephemeral=True)
-        except:
-            pass
 
 
 # ---------- /ギャンブル確率設定 ----------
@@ -741,7 +492,11 @@ async def gamble_prob_set(interaction: discord.Interaction, probability: int):
         def _set_prob_sync(p, db_path):
             conn = sqlite3.connect(db_path)
             cur = conn.cursor()
-            cur.execute("CREATE TABLE IF NOT EXISTS gamble_settings (id INTEGER PRIMARY KEY, probability_level INTEGER DEFAULT 3)")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS gamble_settings (
+                    id INTEGER PRIMARY KEY, probability_level INTEGER DEFAULT 3
+                )
+            """)
             cur.execute("INSERT OR IGNORE INTO gamble_settings (id, probability_level) VALUES (1,3)")
             cur.execute("UPDATE gamble_settings SET probability_level=? WHERE id=1", (p,))
             conn.commit()
@@ -784,7 +539,7 @@ async def shopadd(interaction: discord.Interaction, action: str, shop_name: str)
         await interaction.response.send_message("⚠️ エラーが発生しました。", ephemeral=True)
 
 
-# ---------- /shop (商品追加/削除) ----------
+# ---------- /shop ----------
 @tree.command(name="shop", description="管理者専用: ショップの商品を追加または削除")
 @app_commands.describe(
     action="追加 or 削除",
@@ -814,8 +569,13 @@ async def shop(interaction: discord.Interaction,
             conn = sqlite3.connect(db_path)
             cur = conn.cursor()
             cur.execute("CREATE TABLE IF NOT EXISTS shops (shop_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE)")
-            cur.execute("CREATE TABLE IF NOT EXISTS shop_items (item_id INTEGER PRIMARY KEY AUTOINCREMENT, shop_id INTEGER, name TEXT, description TEXT, price INTEGER, stock TEXT, role_id INTEGER, role_duration INTEGER)")
-            # check shop exists
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS shop_items (
+                    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    shop_id INTEGER, name TEXT, description TEXT,
+                    price INTEGER, stock TEXT, role_id INTEGER, role_duration INTEGER
+                )
+            """)
             cur.execute("SELECT shop_id FROM shops WHERE name=?", (sname,))
             shop_row = cur.fetchone()
             if not shop_row:
@@ -886,7 +646,6 @@ async def shop(interaction: discord.Interaction,
 async def balance_cmd(interaction: discord.Interaction):
     try:
         await interaction.response.defer(ephemeral=True)
-        # ensure user exists
         await db.execute(_add_user_if_not_exists_sync, interaction.user.id, DB_PATH)
 
         def _get_balance_sync(uid, db_path):
@@ -903,7 +662,7 @@ async def balance_cmd(interaction: discord.Interaction):
     except Exception as e:
         print(f"[balance_cmd] error: {e}")
         try:
-            await interaction.followup.send(f"⚠️ エラーが発生しました: {e}", ephemeral=True)
+            await interaction.followup.send("⚠️ エラーが発生しました。", ephemeral=True)
         except:
             pass
 
@@ -915,7 +674,12 @@ async def ranking(interaction: discord.Interaction):
         def _fetch_top_sync(db_path):
             conn = sqlite3.connect(db_path, timeout=10)
             cur = conn.cursor()
-            cur.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 0, total_received INTEGER DEFAULT 0, total_spent INTEGER DEFAULT 0)")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 0,
+                    total_received INTEGER DEFAULT 0, total_spent INTEGER DEFAULT 0
+                )
+            """)
             cur.execute("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 15")
             rows = cur.fetchall()
             conn.close()
@@ -947,7 +711,12 @@ async def stats(interaction: discord.Interaction):
         def _stats_sync(db_path):
             conn = sqlite3.connect(db_path, timeout=10)
             cur = conn.cursor()
-            cur.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 0, total_received INTEGER DEFAULT 0, total_spent INTEGER DEFAULT 0)")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 0,
+                    total_received INTEGER DEFAULT 0, total_spent INTEGER DEFAULT 0
+                )
+            """)
             cur.execute("SELECT SUM(balance), SUM(total_spent) FROM users")
             tot = cur.fetchone()
             cur.execute("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 1")
@@ -1018,7 +787,7 @@ async def shop_list(interaction: discord.Interaction):
         await interaction.response.send_message("⚠️ エラーが発生しました。")
 
 
-# ---------- /ショップ（表示） ----------
+# ---------- /ショップ表示 ----------
 @tree.command(name="ショップ", description="指定したショップの商品を表示")
 @app_commands.describe(shop_name="ショップの名前")
 async def show_shop(interaction: discord.Interaction, shop_name: str):
@@ -1027,7 +796,13 @@ async def show_shop(interaction: discord.Interaction, shop_name: str):
             conn = sqlite3.connect(db_path, timeout=10)
             cur = conn.cursor()
             cur.execute("CREATE TABLE IF NOT EXISTS shops (shop_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE)")
-            cur.execute("CREATE TABLE IF NOT EXISTS shop_items (item_id INTEGER PRIMARY KEY AUTOINCREMENT, shop_id INTEGER, name TEXT, description TEXT, price INTEGER, stock TEXT, role_id INTEGER, role_duration INTEGER)")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS shop_items (
+                    item_id INTEGER PRIMARY KEY AUTOINCREMENT, shop_id INTEGER,
+                    name TEXT, description TEXT, price INTEGER, stock TEXT,
+                    role_id INTEGER, role_duration INTEGER
+                )
+            """)
             cur.execute("SELECT shop_id FROM shops WHERE name=?", (sname,))
             row = cur.fetchone()
             if not row:
@@ -1101,118 +876,12 @@ async def transfer(interaction: discord.Interaction, target: discord.User, amoun
 async def help_cmd(interaction: discord.Interaction):
     msg = (
         "📘 **Raruin Bot コマンド一覧**\n\n"
-        "（略）"  # 長い文はそのまま元のヘルプ文を入れてください
+        "（略）"
     )
     await interaction.response.send_message(msg, ephemeral=True)
 
 
-# ---------- /今日の収支 ----------
-@tree.command(name="今日の収支", description="自分の受取・支出・残高をまとめて表示")
-async def today_income(interaction: discord.Interaction):
-    try:
-        await db.execute(_add_user_if_not_exists_sync, interaction.user.id, DB_PATH)
-        def _today_sync(uid, db_path):
-            conn = sqlite3.connect(db_path, timeout=10)
-            cur = conn.cursor()
-            cur.execute("SELECT balance, total_received, total_spent FROM users WHERE user_id=?", (uid,))
-            r = cur.fetchone()
-            conn.close()
-            return r if r else (0, 0, 0)
-        balance, received, spent = await db.execute(_today_sync, interaction.user.id, DB_PATH)
-        await interaction.response.send_message(
-            f"💰 {interaction.user.display_name} さんの収支:\n"
-            f"残高: {balance} Raruin\n"
-            f"受取合計: {received} Raruin\n"
-            f"支出合計: {spent} Raruin"
-        )
-    except Exception as e:
-        print(f"[today_income] error: {e}")
-        await interaction.response.send_message("⚠️ エラーが発生しました。")
-
-
-# ---------- /ショップ検索 ----------
-@tree.command(name="ショップ検索", description="商品名でショップ内を検索")
-@app_commands.describe(keyword="検索したい商品名")
-async def shop_search(interaction: discord.Interaction, keyword: str):
-    try:
-        def _search_sync(kw, db_path):
-            conn = sqlite3.connect(db_path, timeout=10)
-            cur = conn.cursor()
-            cur.execute("CREATE TABLE IF NOT EXISTS shop_items (item_id INTEGER PRIMARY KEY AUTOINCREMENT, shop_id INTEGER, name TEXT, description TEXT, price INTEGER, stock TEXT, role_id INTEGER, role_duration INTEGER)")
-            cur.execute("CREATE TABLE IF NOT EXISTS shops (shop_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE)")
-            cur.execute(
-                "SELECT s.name, i.name, i.price FROM shop_items i JOIN shops s ON i.shop_id = s.shop_id WHERE i.name LIKE ?",
-                (f"%{kw}%",)
-            )
-            rows = cur.fetchall()
-            conn.close()
-            return rows
-        rows = await db.execute(_search_sync, keyword, DB_PATH)
-        if not rows:
-            await interaction.response.send_message("該当する商品はありません。")
-            return
-        msg = "🔍 検索結果:\n"
-        for shop_name, item_name, price in rows:
-            msg += f"{shop_name} - {item_name}: {price} Raruin\n"
-        await interaction.response.send_message(msg)
-    except Exception as e:
-        print(f"[shop_search] error: {e}")
-        await interaction.response.send_message("⚠️ エラーが発生しました。")
-
-
-# ---------- /最近の購入 ----------
-@tree.command(name="最近の購入", description="最近購入した商品を確認")
-async def recent_purchase(interaction: discord.Interaction):
-    try:
-        def _recent_sync(uid, db_path):
-            conn = sqlite3.connect(db_path, timeout=10)
-            cur = conn.cursor()
-            cur.execute('CREATE TABLE IF NOT EXISTS purchase_history (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, shop_name TEXT, item_name TEXT, price INTEGER, timestamp TEXT)')
-            cur.execute("SELECT shop_name, item_name, price, timestamp FROM purchase_history WHERE user_id=? ORDER BY id DESC LIMIT 5", (uid,))
-            rows = cur.fetchall()
-            conn.close()
-            return rows
-        rows = await db.execute(_recent_sync, interaction.user.id, DB_PATH)
-        if not rows:
-            await interaction.response.send_message("購入履歴はありません。")
-            return
-        msg = "🛒 最近の購入:\n"
-        for shop, item, price, ts in rows:
-            msg += f"{ts[:16]} - {shop} - {item}: {price} Raruin\n"
-        await interaction.response.send_message(msg)
-    except Exception as e:
-        print(f"[recent_purchase] error: {e}")
-        await interaction.response.send_message("⚠️ エラーが発生しました。")
-
-
-# ---------- /リーダーボード ----------
-@tree.command(name="リーダーボード", description="Raruin上位15名の詳細を表示")
-async def leaderboard(interaction: discord.Interaction):
-    try:
-        def _leader_sync(db_path):
-            conn = sqlite3.connect(db_path, timeout=10)
-            cur = conn.cursor()
-            cur.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 0, total_received INTEGER DEFAULT 0, total_spent INTEGER DEFAULT 0)")
-            cur.execute("SELECT user_id, balance, total_received, total_spent FROM users ORDER BY balance DESC LIMIT 15")
-            rows = cur.fetchall()
-            conn.close()
-            return rows
-        rows = await db.execute(_leader_sync, DB_PATH)
-        msg = "🏆 Raruinリーダーボード（上位15名）\n"
-        for i, (uid, bal, rec, spent) in enumerate(rows, start=1):
-            try:
-                user = await bot.fetch_user(uid)
-                name = user.name
-            except:
-                name = f"ユーザーID:{uid}"
-            msg += f"{i}. {name}: 残高 {bal}, 受取 {rec}, 支出 {spent}\n"
-        await interaction.response.send_message(msg)
-    except Exception as e:
-        print(f"[leaderboard] error: {e}")
-        await interaction.response.send_message("⚠️ エラーが発生しました。")
-
-
-# ---------- 役立ち / bot情報 / tips ----------
+# ---------- /役立ち / bot情報 / tips ----------
 @tree.command(name="役立ち", description="便利なRaruin情報を表示")
 async def tips(interaction: discord.Interaction):
     msg = (
@@ -1222,6 +891,7 @@ async def tips(interaction: discord.Interaction):
         "・ショップを見て安く買える商品をチェック\n"
     )
     await interaction.response.send_message(msg)
+
 
 @tree.command(name="bot情報", description="Botのバージョンや稼働状況を確認")
 async def bot_info(interaction: discord.Interaction):
@@ -1234,7 +904,6 @@ async def bot_info(interaction: discord.Interaction):
         f"現在オンライン中"
     )
     await interaction.response.send_message(msg)
-
 
 # ---------- Part 5: ギャンブル・自動付与・起動ログ・keep-alive (修正版) ----------
 import os
