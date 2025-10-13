@@ -399,6 +399,9 @@ async def update_balance(user_id: int, amount: int):
 # --------------------
 # 最後に: on_ready で自動バックアップタスクを開始する（ここは既存の on_ready に組み込んでください）
 # --------------------
+# --------------------
+# 最後に: on_ready で自動バックアップタスクを開始する（ここは既存の on_ready に組み込んでください）
+# --------------------
 @bot.event
 async def on_ready():
     try:
@@ -429,6 +432,28 @@ async def on_ready():
     print("Bot is ready.")
 
 # --- end of section ---
+
+
+# ===================================================
+# 🔁 旧コード互換用関数（古い構文で呼ばれても落ちないようにする）
+# ===================================================
+def _add_user_if_not_exists_sync(user_id: int):
+    """
+    古いコードで `_add_user_if_not_exists_sync` を呼び出しても落ちないようにする互換用関数。
+    内部で `add_user_if_not_exists` を呼び出します。
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Bot のイベントループがすでに動いている場合
+            asyncio.create_task(add_user_if_not_exists(user_id))
+        else:
+            loop.run_until_complete(add_user_if_not_exists(user_id))
+    except RuntimeError:
+        # ループが存在しない場合は新しく作って実行
+        asyncio.run(add_user_if_not_exists(user_id))
+    except Exception as e:
+        print(f"[旧互換 _add_user_if_not_exists_sync] エラー: {e}")
 
 
 
