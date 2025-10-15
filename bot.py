@@ -285,15 +285,14 @@ except Exception as e:
 # --------------------
 db = PersistentDB(DB_PATH)
 
-
 # ---------- ヘルパー: ターゲット解決（@役職名 に堅牢対応） ----------
 import re
 from typing import List, Optional
 
 async def resolve_target_members(target: str, interaction: discord.Interaction) -> List[discord.Member]:
     """
-    target: ユーザー/ロール指定の文字列（例: '@役職名', '<@123...>', '<@&roleid>', '1234567890', 'ユーザー名'）
-    戻り値: discord.Member のリスト（見つからなければ [] を返す）
+    target: '@役職名', '<@123>', '<@&roleid>', '1234567890', 'ユーザー名' などを受け取り、
+    discord.Member のリストを返す（見つからなければ [] を返す）。
     """
     guild = interaction.guild
     if not guild:
@@ -301,16 +300,16 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
 
     raw = target.strip()
 
-    # 1) ロールメンション形式 <@&123>
-    rm = re.match(r'^<@&(?P<id>\d+)>$', raw)
-    if rm:
-        role = guild.get_role(int(rm.group("id")))
+    # role mention <@&id>
+    m = re.match(r'^<@&(?P<id>\d+)>$', raw)
+    if m:
+        role = guild.get_role(int(m.group("id")))
         return list(role.members) if role else []
 
-    # 2) ユーザーメンション形式 <@!123> または <@123>
-    um = re.match(r'^<@!?(?P<id>\d+)>$', raw)
-    if um:
-        uid = int(um.group("id"))
+    # user mention <@!id> or <@id>
+    m = re.match(r'^<@!?(?P<id>\d+)>$', raw)
+    if m:
+        uid = int(m.group("id"))
         member = guild.get_member(uid)
         if not member:
             try:
@@ -319,7 +318,7 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
                 member = None
         return [member] if member else []
 
-    # 3) 先頭が @ （全角＠も含む）で @役職名 の場合
+    # starts with @ (role name)
     if raw.startswith("@") or raw.startswith("＠"):
         name = raw.lstrip("@\uFF20").strip()
         role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
@@ -333,7 +332,7 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
             return list(contains[0].members)
         return []
 
-    # 4) 数字のみ -> ID として member または role を探す
+    # all digits -> id (member or role)
     if raw.isdigit():
         uid = int(raw)
         member = guild.get_member(uid)
@@ -348,12 +347,12 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
         if role:
             return list(role.members)
 
-    # 5) ロール名そのもの（プレーン）を大文字小文字無視で完全一致
+    # exact role name
     role = discord.utils.find(lambda r: r.name.lower() == raw.lower(), guild.roles)
     if role:
         return list(role.members)
 
-    # 6) ユーザー名/ニックネーム/name#discriminator の完全一致
+    # exact username / nick / name#discrim
     found = []
     for mbr in guild.members:
         if mbr.name == raw or (mbr.nick and mbr.nick == raw) or f"{mbr.name}#{mbr.discriminator}" == raw:
@@ -361,7 +360,7 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
     if found:
         return found[:50]
 
-    # 7) 部分一致（ユーザー名/ニックネーム）
+    # partial match
     partial = [mbr for mbr in guild.members if raw.lower() in mbr.name.lower() or (mbr.nick and raw.lower() in mbr.nick.lower())]
     return partial[:50]
 
@@ -391,8 +390,7 @@ def _find_role_from_input(raw: str, guild: discord.Guild) -> Optional[discord.Ro
         contains = [r for r in guild.roles if name.lower() in r.name.lower()]
         if contains:
             return contains[0]
-    role = discord.utils.find(lambda r: r.name.lower() == s.lower(), guild.roles)
-    return role
+    return discord.utils.find(lambda r: r.name.lower() == s.lower(), guild.roles)
 
 
 # --------------------
@@ -402,7 +400,6 @@ def _find_role_from_input(raw: str, guild: discord.Guild) -> Optional[discord.Ro
 @app_commands.describe(target="ユーザーまたはロール", amount="付与する金額")
 async def distribute(interaction: discord.Interaction, target: str, amount: int):
     try:
-        # 管理者チェック
         if not await is_admin(interaction.user.id):
             await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
             return
@@ -410,11 +407,11 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
             await interaction.response.send_message("⚠️ 付与額は1以上にしてください。", ephemeral=True)
             return
 
-        # 早めに defer（重い DB 処理中に interaction がタイムアウトするのを避ける）
+        # defer early to avoid interaction timeout while DB ops run
         await interaction.response.defer(ephemeral=True)
 
         members = await resolve_target_members(target, interaction)
-        # resolve が空ならロール名で再確認
+        # fallback: if resolve failed but a role string exists, try to find role object
         if not members and interaction.guild:
             role_obj = _find_role_from_input(target, interaction.guild)
             if role_obj:
@@ -426,7 +423,6 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
 
         member_ids = [m.id for m in members]
 
-        # DB 書き込みは同期関数で実行（db.execute がスレッドで実行してくれる）
         def _add_balance_sync(member_ids, amt):
             conn = None
             try:
@@ -454,14 +450,13 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
                 if conn:
                     conn.close()
 
-        added_count = await db.execute(_add_balance_sync, member_ids, amount)
-
-        if not added_count:
+        added = await db.execute(_add_balance_sync, member_ids, amount)
+        if not added:
             await interaction.followup.send("⚠️ データベース処理に失敗しました。", ephemeral=True)
             return
 
-        target_name = members[0].display_name if len(members) == 1 else f"{len(members)} 人のメンバー"
-        await interaction.followup.send(f"🎁 {target_name} に **{amount:,} Raruin** を付与しました。")
+        name = members[0].display_name if len(members) == 1 else f"{len(members)} 人のメンバー"
+        await interaction.followup.send(f"🎁 {name} に **{amount:,} Raruin** を付与しました。")
     except Exception as e:
         print(f"[distribute] error: {e}")
         try:
@@ -487,7 +482,6 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
         await interaction.response.defer(ephemeral=True)
 
         members = await resolve_target_members(target, interaction)
-        # resolve が空ならロール名で再確認
         if not members and interaction.guild:
             role_obj = _find_role_from_input(target, interaction.guild)
             if role_obj:
@@ -526,21 +520,19 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
                 if conn:
                     conn.close()
 
-        subbed_count = await db.execute(_subtract_balance_sync, member_ids, amount)
-
-        if not subbed_count:
+        subbed = await db.execute(_subtract_balance_sync, member_ids, amount)
+        if not subbed:
             await interaction.followup.send("⚠️ データベース処理に失敗しました。", ephemeral=True)
             return
 
-        target_name = members[0].display_name if len(members) == 1 else f"{len(members)} 人のメンバー"
-        await interaction.followup.send(f"💸 {target_name} から **{amount:,} Raruin** を減算しました。")
+        name = members[0].display_name if len(members) == 1 else f"{len(members)} 人のメンバー"
+        await interaction.followup.send(f"💸 {name} から **{amount:,} Raruin** を減算しました。")
     except Exception as e:
         print(f"[payment] error: {e}")
         try:
             await interaction.followup.send("⚠️ エラーが発生しました。", ephemeral=True)
         except:
             pass
-
 
 
 
@@ -922,23 +914,30 @@ async def transfer(interaction: discord.Interaction, target: discord.User, amoun
             await interaction.response.send_message("⚠️ 額は1以上にしてください。", ephemeral=True)
             return
 
-        # defer early
         await interaction.response.defer(ephemeral=True)
-
-        # ensure both users exist in DB
-        await db.execute(add_user_if_not_exists_sync, interaction.user.id)
-        await db.execute(add_user_if_not_exists_sync, target.id)
 
         def _transfer_sync(from_id, to_id, amt):
             conn = None
             try:
                 conn = db._connect()
                 cur = conn.cursor()
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id INTEGER PRIMARY KEY,
+                        balance INTEGER DEFAULT 0,
+                        total_received INTEGER DEFAULT 0,
+                        total_spent INTEGER DEFAULT 0
+                    )
+                """)
+                # ensure rows exist
+                cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (from_id,))
+                cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (to_id,))
+                # check balance
                 cur.execute("SELECT balance FROM users WHERE user_id=?", (from_id,))
                 r = cur.fetchone()
-                if not r or r[0] < amt:
-                    short = int(r[0]) if r else 0
-                    return False, short
+                bal = int(r[0]) if r and r[0] is not None else 0
+                if bal < amt:
+                    return False, bal
                 cur.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?", (amt, amt, from_id))
                 cur.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?", (amt, amt, to_id))
                 conn.commit()
@@ -955,7 +954,7 @@ async def transfer(interaction: discord.Interaction, target: discord.User, amoun
             await interaction.followup.send(f"💰 残高が足りません（現在: {short}）", ephemeral=True)
             return
 
-        # DM send best-effort
+        # DM best-effort
         try:
             await target.send(f"📩 {interaction.user.display_name} から {amount} Raruin を受け取りました！")
         except:
