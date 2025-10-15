@@ -298,7 +298,9 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
     if not guild:
         return []
 
-    raw = target.strip()
+    raw = (target or "").strip()
+    if not raw:
+        return []
 
     # role mention <@&id>
     m = re.match(r'^<@&(?P<id>\d+)>$', raw)
@@ -314,7 +316,7 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
         if not member:
             try:
                 member = await guild.fetch_member(uid)
-            except:
+            except Exception:
                 member = None
         return [member] if member else []
 
@@ -339,7 +341,7 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
         if not member:
             try:
                 member = await guild.fetch_member(uid)
-            except:
+            except Exception:
                 member = None
         if member:
             return [member]
@@ -371,7 +373,7 @@ def _find_role_from_input(raw: str, guild: discord.Guild) -> Optional[discord.Ro
     """
     if not guild:
         return None
-    s = raw.strip()
+    s = (raw or "").strip()
     m = re.match(r'^<@&(?P<id>\d+)>$', s)
     if m:
         return guild.get_role(int(m.group("id")))
@@ -394,7 +396,7 @@ def _find_role_from_input(raw: str, guild: discord.Guild) -> Optional[discord.Ro
 
 
 # --------------------
-# /配布 （修正版：DBアクセスは別スレッドで実行して応答が固まらないように）
+# /配布 （改良版：DB処理は別スレッドで実行）
 # --------------------
 @tree.command(name="配布", description="指定したユーザーまたはロールにRaruinを付与（管理者専用）")
 @app_commands.describe(target="ユーザーまたはロール", amount="付与する金額")
@@ -407,11 +409,11 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
             await interaction.response.send_message("⚠️ 付与額は1以上にしてください。", ephemeral=True)
             return
 
-        # defer early to avoid interaction timeout while DB ops run
+        # defer early
         await interaction.response.defer(ephemeral=True)
 
         members = await resolve_target_members(target, interaction)
-        # fallback: if resolve failed but a role string exists, try to find role object
+        # fallback to role object search if resolve returned empty
         if not members and interaction.guild:
             role_obj = _find_role_from_input(target, interaction.guild)
             if role_obj:
@@ -423,7 +425,7 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
 
         member_ids = [m.id for m in members]
 
-        def _add_balance_sync(member_ids, amt):
+        def _add_balance_sync(member_ids_local, amt_local):
             conn = None
             try:
                 conn = db._connect()
@@ -436,13 +438,13 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
                         total_spent INTEGER DEFAULT 0
                     )
                 """)
-                cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids])
+                cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids_local])
                 cur.executemany(
                     "UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
-                    [(amt, amt, uid) for uid in member_ids]
+                    [(amt_local, amt_local, uid) for uid in member_ids_local]
                 )
                 conn.commit()
-                return len(member_ids)
+                return len(member_ids_local)
             except Exception as e:
                 print(f"[distribute._add_balance_sync] error: {e}")
                 return 0
@@ -450,7 +452,8 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
                 if conn:
                     conn.close()
 
-        added = await db.execute(_add_balance_sync, member_ids, amount)
+        # run DB op in thread to avoid blocking
+        added = await asyncio.to_thread(_add_balance_sync, member_ids, amount)
         if not added:
             await interaction.followup.send("⚠️ データベース処理に失敗しました。", ephemeral=True)
             return
@@ -466,7 +469,7 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
 
 
 # --------------------
-# /支払い （修正版：DBアクセスは別スレッドで実行して応答が固まらないように）
+# /支払い （改良版：DB処理は別スレッドで実行）
 # --------------------
 @tree.command(name="支払い", description="指定したユーザーまたはロールのRaruinを減らす（管理者専用）")
 @app_commands.describe(target="ユーザーまたはロール", amount="減算する金額")
@@ -493,7 +496,7 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
 
         member_ids = [m.id for m in members]
 
-        def _subtract_balance_sync(member_ids, amt):
+        def _subtract_balance_sync(member_ids_local, amt_local):
             conn = None
             try:
                 conn = db._connect()
@@ -506,13 +509,13 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
                         total_spent INTEGER DEFAULT 0
                     )
                 """)
-                cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids])
+                cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids_local])
                 cur.executemany(
                     "UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?",
-                    [(amt, amt, uid) for uid in member_ids]
+                    [(amt_local, amt_local, uid) for uid in member_ids_local]
                 )
                 conn.commit()
-                return len(member_ids)
+                return len(member_ids_local)
             except Exception as e:
                 print(f"[payment._subtract_balance_sync] error: {e}")
                 return 0
@@ -520,7 +523,7 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
                 if conn:
                     conn.close()
 
-        subbed = await db.execute(_subtract_balance_sync, member_ids, amount)
+        subbed = await asyncio.to_thread(_subtract_balance_sync, member_ids, amount)
         if not subbed:
             await interaction.followup.send("⚠️ データベース処理に失敗しました。", ephemeral=True)
             return
@@ -533,6 +536,7 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
             await interaction.followup.send("⚠️ エラーが発生しました。", ephemeral=True)
         except:
             pass
+
 
 
 
@@ -932,12 +936,13 @@ async def transfer(interaction: discord.Interaction, target: discord.User, amoun
                 # ensure rows exist
                 cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (from_id,))
                 cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (to_id,))
-                # check balance
+
                 cur.execute("SELECT balance FROM users WHERE user_id=?", (from_id,))
                 r = cur.fetchone()
                 bal = int(r[0]) if r and r[0] is not None else 0
                 if bal < amt:
                     return False, bal
+
                 cur.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?", (amt, amt, from_id))
                 cur.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?", (amt, amt, to_id))
                 conn.commit()
@@ -949,7 +954,7 @@ async def transfer(interaction: discord.Interaction, target: discord.User, amoun
                 if conn:
                     conn.close()
 
-        ok, short = await db.execute(_transfer_sync, interaction.user.id, target.id, amount)
+        ok, short = await asyncio.to_thread(_transfer_sync, interaction.user.id, target.id, amount)
         if not ok:
             await interaction.followup.send(f"💰 残高が足りません（現在: {short}）", ephemeral=True)
             return
