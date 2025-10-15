@@ -289,7 +289,6 @@ db = PersistentDB(DB_PATH)
 # ---------- ヘルパー: ターゲット解決（@役職名 に堅牢対応） ----------
 import re
 from typing import List, Optional
-import sqlite3
 
 async def resolve_target_members(target: str, interaction: discord.Interaction) -> List[discord.Member]:
     """
@@ -305,8 +304,7 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
     # 1) ロールメンション形式 <@&123>
     rm = re.match(r'^<@&(?P<id>\d+)>$', raw)
     if rm:
-        rid = int(rm.group("id"))
-        role = guild.get_role(rid)
+        role = guild.get_role(int(rm.group("id")))
         return list(role.members) if role else []
 
     # 2) ユーザーメンション形式 <@!123> または <@123>
@@ -321,9 +319,9 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
                 member = None
         return [member] if member else []
 
-    # 3) 先頭が @ （全角＠も含む）で @役職名 の場合 -> ロール名で検索（完全一致：大/小文字無視）
+    # 3) 先頭が @ （全角＠も含む）で @役職名 の場合
     if raw.startswith("@") or raw.startswith("＠"):
-        name = raw.lstrip("@\uFF20").strip()  # 半角/全角@を除去
+        name = raw.lstrip("@\uFF20").strip()
         role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
         if role:
             return list(role.members)
@@ -404,6 +402,7 @@ def _find_role_from_input(raw: str, guild: discord.Guild) -> Optional[discord.Ro
 @app_commands.describe(target="ユーザーまたはロール", amount="付与する金額")
 async def distribute(interaction: discord.Interaction, target: str, amount: int):
     try:
+        # 管理者チェック
         if not await is_admin(interaction.user.id):
             await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
             return
@@ -411,10 +410,11 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
             await interaction.response.send_message("⚠️ 付与額は1以上にしてください。", ephemeral=True)
             return
 
+        # 早めに defer（重い DB 処理中に interaction がタイムアウトするのを避ける）
         await interaction.response.defer(ephemeral=True)
 
         members = await resolve_target_members(target, interaction)
-        # もし resolve が空ならロール名として再確認
+        # resolve が空ならロール名で再確認
         if not members and interaction.guild:
             role_obj = _find_role_from_input(target, interaction.guild)
             if role_obj:
@@ -426,11 +426,11 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
 
         member_ids = [m.id for m in members]
 
-        def _add_balance_sync(member_ids, amt, db_path):
+        # DB 書き込みは同期関数で実行（db.execute がスレッドで実行してくれる）
+        def _add_balance_sync(member_ids, amt):
             conn = None
             try:
-                conn = sqlite3.connect(db_path, timeout=30)
-                conn.execute("PRAGMA journal_mode=WAL;")
+                conn = db._connect()
                 cur = conn.cursor()
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS users (
@@ -454,8 +454,7 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
                 if conn:
                     conn.close()
 
-        # PersistentDB wrapper: run in executor via db.execute for consistency
-        added_count = await db.execute(_add_balance_sync, member_ids, amount, DB_PATH)
+        added_count = await db.execute(_add_balance_sync, member_ids, amount)
 
         if not added_count:
             await interaction.followup.send("⚠️ データベース処理に失敗しました。", ephemeral=True)
@@ -488,7 +487,7 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
         await interaction.response.defer(ephemeral=True)
 
         members = await resolve_target_members(target, interaction)
-        # もし resolve が空ならロール名として再確認
+        # resolve が空ならロール名で再確認
         if not members and interaction.guild:
             role_obj = _find_role_from_input(target, interaction.guild)
             if role_obj:
@@ -500,11 +499,10 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
 
         member_ids = [m.id for m in members]
 
-        def _subtract_balance_sync(member_ids, amt, db_path):
+        def _subtract_balance_sync(member_ids, amt):
             conn = None
             try:
-                conn = sqlite3.connect(db_path, timeout=30)
-                conn.execute("PRAGMA journal_mode=WAL;")
+                conn = db._connect()
                 cur = conn.cursor()
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS users (
@@ -528,7 +526,7 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
                 if conn:
                     conn.close()
 
-        subbed_count = await db.execute(_subtract_balance_sync, member_ids, amount, DB_PATH)
+        subbed_count = await db.execute(_subtract_balance_sync, member_ids, amount)
 
         if not subbed_count:
             await interaction.followup.send("⚠️ データベース処理に失敗しました。", ephemeral=True)
@@ -919,42 +917,57 @@ async def show_shop(interaction: discord.Interaction, shop_name: str):
 @tree.command(name="渡す", description="指定したユーザーにRaruinを渡す")
 @app_commands.describe(target="渡したいユーザー（@で指定）", amount="渡す額")
 async def transfer(interaction: discord.Interaction, target: discord.User, amount: int):
-    if amount <= 0:
-        await interaction.response.send_message("⚠️ 額は1以上にしてください。", ephemeral=True)
-        return
     try:
-        await db.execute(_add_user_if_not_exists_sync, interaction.user.id, DB_PATH)
-        await db.execute(_add_user_if_not_exists_sync, target.id, DB_PATH)
-
-        def _transfer_sync(from_id, to_id, amt, db_path):
-            conn = sqlite3.connect(db_path, timeout=10)
-            conn.execute("PRAGMA journal_mode=WAL;")
-            cur = conn.cursor()
-            cur.execute("SELECT balance FROM users WHERE user_id=?", (from_id,))
-            r = cur.fetchone()
-            if not r or r[0] < amt:
-                conn.close()
-                return False, (r[0] if r else 0)
-            cur.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?", (amt, amt, from_id))
-            cur.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?", (amt, amt, to_id))
-            conn.commit()
-            conn.close()
-            return True, None
-
-        ok, short = await db.execute(_transfer_sync, interaction.user.id, target.id, amount, DB_PATH)
-        if not ok:
-            await interaction.response.send_message(f"💰 残高が足りません（現在: {short}）", ephemeral=True)
+        if amount <= 0:
+            await interaction.response.send_message("⚠️ 額は1以上にしてください。", ephemeral=True)
             return
 
+        # defer early
+        await interaction.response.defer(ephemeral=True)
+
+        # ensure both users exist in DB
+        await db.execute(add_user_if_not_exists_sync, interaction.user.id)
+        await db.execute(add_user_if_not_exists_sync, target.id)
+
+        def _transfer_sync(from_id, to_id, amt):
+            conn = None
+            try:
+                conn = db._connect()
+                cur = conn.cursor()
+                cur.execute("SELECT balance FROM users WHERE user_id=?", (from_id,))
+                r = cur.fetchone()
+                if not r or r[0] < amt:
+                    short = int(r[0]) if r else 0
+                    return False, short
+                cur.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?", (amt, amt, from_id))
+                cur.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?", (amt, amt, to_id))
+                conn.commit()
+                return True, None
+            except Exception as e:
+                print(f"[transfer._transfer_sync] error: {e}")
+                return False, 0
+            finally:
+                if conn:
+                    conn.close()
+
+        ok, short = await db.execute(_transfer_sync, interaction.user.id, target.id, amount)
+        if not ok:
+            await interaction.followup.send(f"💰 残高が足りません（現在: {short}）", ephemeral=True)
+            return
+
+        # DM send best-effort
         try:
             await target.send(f"📩 {interaction.user.display_name} から {amount} Raruin を受け取りました！")
         except:
             pass
-        await interaction.response.send_message(f"✅ {target.display_name} に {amount} Raruin を渡しました。")
+
+        await interaction.followup.send(f"✅ {target.display_name} に {amount} Raruin を渡しました。")
     except Exception as e:
         print(f"[transfer] error: {e}")
-        await interaction.response.send_message("⚠️ エラーが発生しました。")
-
+        try:
+            await interaction.followup.send("⚠️ エラーが発生しました。", ephemeral=True)
+        except:
+            pass
 # ---------- /今日の収支 ----------
 @tree.command(name="今日の収支", description="今日の収支を確認します")
 async def daily_profit(interaction: discord.Interaction):
