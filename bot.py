@@ -289,6 +289,7 @@ db = PersistentDB(DB_PATH)
 # ---------- ヘルパー: ターゲット解決（@役職名 に堅牢対応） ----------
 import re
 from typing import List, Optional
+import sqlite3
 
 async def resolve_target_members(target: str, interaction: discord.Interaction) -> List[discord.Member]:
     """
@@ -306,7 +307,7 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
     if rm:
         rid = int(rm.group("id"))
         role = guild.get_role(rid)
-        return role.members if role else []
+        return list(role.members) if role else []
 
     # 2) ユーザーメンション形式 <@!123> または <@123>
     um = re.match(r'^<@!?(?P<id>\d+)>$', raw)
@@ -323,18 +324,16 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
     # 3) 先頭が @ （全角＠も含む）で @役職名 の場合 -> ロール名で検索（完全一致：大/小文字無視）
     if raw.startswith("@") or raw.startswith("＠"):
         name = raw.lstrip("@\uFF20").strip()  # 半角/全角@を除去
-        # 完全一致（case-insensitive）
         role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
         if role:
-            return role.members  # 空でも [] を返す（呼び出し側でメッセージ出し分け）
-        # 完全一致見つからなければ部分一致（先頭一致 → 含む順）で検索（上位1つのロールを採用）
+            return list(role.members)
         starts = [r for r in guild.roles if r.name.lower().startswith(name.lower())]
         if starts:
-            return starts[0].members
+            return list(starts[0].members)
         contains = [r for r in guild.roles if name.lower() in r.name.lower()]
         if contains:
-            return contains[0].members
-        return []  # 見つからない
+            return list(contains[0].members)
+        return []
 
     # 4) 数字のみ -> ID として member または role を探す
     if raw.isdigit():
@@ -349,12 +348,12 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
             return [member]
         role = guild.get_role(uid)
         if role:
-            return role.members
+            return list(role.members)
 
     # 5) ロール名そのもの（プレーン）を大文字小文字無視で完全一致
     role = discord.utils.find(lambda r: r.name.lower() == raw.lower(), guild.roles)
     if role:
-        return role.members
+        return list(role.members)
 
     # 6) ユーザー名/ニックネーム/name#discriminator の完全一致
     found = []
@@ -369,110 +368,181 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
     return partial[:50]
 
 
-# ヘルパー: 入力からロールオブジェクトを探す（resolve_target_members が見つけられなかった場合の補助）
 def _find_role_from_input(raw: str, guild: discord.Guild) -> Optional[discord.Role]:
+    """
+    resolve_target_members が見つけられなかった場合の補助。
+    """
     if not guild:
         return None
     s = raw.strip()
-    # mention形式
     m = re.match(r'^<@&(?P<id>\d+)>$', s)
     if m:
         return guild.get_role(int(m.group("id")))
-    # idのみ
     if s.isdigit():
         r = guild.get_role(int(s))
         if r:
             return r
-    # @で始まる名前（半角/全角@許容）
     name = s.lstrip("@\uFF20").strip()
     if name:
-        # 完全一致
         role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
         if role:
             return role
-        # 先頭一致 -> 部分一致
         starts = [r for r in guild.roles if r.name.lower().startswith(name.lower())]
         if starts:
             return starts[0]
         contains = [r for r in guild.roles if name.lower() in r.name.lower()]
         if contains:
             return contains[0]
-    # 最終手段: プレーン文字列をロール名として探す（完全一致）
     role = discord.utils.find(lambda r: r.name.lower() == s.lower(), guild.roles)
     return role
 
 
 # --------------------
-# /配布
+# /配布 （修正版：DBアクセスは別スレッドで実行して応答が固まらないように）
 # --------------------
 @tree.command(name="配布", description="指定したユーザーまたはロールにRaruinを付与（管理者専用）")
 @app_commands.describe(target="ユーザーまたはロール", amount="付与する金額")
 async def distribute(interaction: discord.Interaction, target: str, amount: int):
-    if not await is_admin(interaction.user.id):
-        await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
-        return
-    if amount <= 0:
-        await interaction.response.send_message("⚠️ 付与額は1以上にしてください。", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
+    try:
+        if not await is_admin(interaction.user.id):
+            await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
+            return
+        if amount <= 0:
+            await interaction.response.send_message("⚠️ 付与額は1以上にしてください。", ephemeral=True)
+            return
 
-    members = await resolve_target_members(target, interaction)
-    if not members:
-        await interaction.followup.send("❌ 対象ユーザーが見つかりません。", ephemeral=True)
-        return
+        await interaction.response.defer(ephemeral=True)
 
-    def _add_balance_sync(member_ids, amt, db_path):
-        conn = sqlite3.connect(db_path, timeout=30)
-        cur = conn.cursor()
-        cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids])
-        cur.executemany("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
-                        [(amt, amt, uid) for uid in member_ids])
-        conn.commit()
-        conn.close()
+        members = await resolve_target_members(target, interaction)
+        # もし resolve が空ならロール名として再確認
+        if not members and interaction.guild:
+            role_obj = _find_role_from_input(target, interaction.guild)
+            if role_obj:
+                members = list(role_obj.members)
 
-    member_ids = [m.id for m in members]
-    await db.execute(_add_balance_sync, member_ids, amount, DB_PATH)
+        if not members:
+            await interaction.followup.send("❌ 対象ユーザーまたはロールが見つかりません。", ephemeral=True)
+            return
 
-    target_name = members[0].display_name if len(members) == 1 else f"{len(members)}人のメンバー"
-    await interaction.followup.send(f"🎁 {target_name} に **{amount:,} Raruin** を付与しました。")
+        member_ids = [m.id for m in members]
+
+        def _add_balance_sync(member_ids, amt, db_path):
+            conn = None
+            try:
+                conn = sqlite3.connect(db_path, timeout=30)
+                conn.execute("PRAGMA journal_mode=WAL;")
+                cur = conn.cursor()
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id INTEGER PRIMARY KEY,
+                        balance INTEGER DEFAULT 0,
+                        total_received INTEGER DEFAULT 0,
+                        total_spent INTEGER DEFAULT 0
+                    )
+                """)
+                cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids])
+                cur.executemany(
+                    "UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
+                    [(amt, amt, uid) for uid in member_ids]
+                )
+                conn.commit()
+                return len(member_ids)
+            except Exception as e:
+                print(f"[distribute._add_balance_sync] error: {e}")
+                return 0
+            finally:
+                if conn:
+                    conn.close()
+
+        # PersistentDB wrapper: run in executor via db.execute for consistency
+        added_count = await db.execute(_add_balance_sync, member_ids, amount, DB_PATH)
+
+        if not added_count:
+            await interaction.followup.send("⚠️ データベース処理に失敗しました。", ephemeral=True)
+            return
+
+        target_name = members[0].display_name if len(members) == 1 else f"{len(members)} 人のメンバー"
+        await interaction.followup.send(f"🎁 {target_name} に **{amount:,} Raruin** を付与しました。")
+    except Exception as e:
+        print(f"[distribute] error: {e}")
+        try:
+            await interaction.followup.send("⚠️ エラーが発生しました。", ephemeral=True)
+        except:
+            pass
+
 
 # --------------------
-# /支払い
+# /支払い （修正版：DBアクセスは別スレッドで実行して応答が固まらないように）
 # --------------------
 @tree.command(name="支払い", description="指定したユーザーまたはロールのRaruinを減らす（管理者専用）")
 @app_commands.describe(target="ユーザーまたはロール", amount="減算する金額")
 async def payment(interaction: discord.Interaction, target: str, amount: int):
-    if not await is_admin(interaction.user.id):
-        await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
-        return
-    if amount <= 0:
-        await interaction.response.send_message("⚠️ 減算額は1以上にしてください。", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
+    try:
+        if not await is_admin(interaction.user.id):
+            await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
+            return
+        if amount <= 0:
+            await interaction.response.send_message("⚠️ 減算額は1以上にしてください。", ephemeral=True)
+            return
 
-    members = await resolve_target_members(target, interaction)
-    if not members:
-        await interaction.followup.send("❌ 対象ユーザーが見つかりません。", ephemeral=True)
-        return
+        await interaction.response.defer(ephemeral=True)
 
-def _subtract_balance_sync(member_ids, amt, db_path):
-    conn = sqlite3.connect(db_path, timeout=30)
-    cur = conn.cursor()
-    
-    # ユーザーを存在しなければ追加
-    cur.executemany(
-        "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
-        [(member_id,) for member_id in member_ids]
-    )
+        members = await resolve_target_members(target, interaction)
+        # もし resolve が空ならロール名として再確認
+        if not members and interaction.guild:
+            role_obj = _find_role_from_input(target, interaction.guild)
+            if role_obj:
+                members = list(role_obj.members)
 
-    # 残高を減算
-    cur.executemany(
-        "UPDATE users SET balance = balance - ? WHERE user_id = ?",
-        [(amt, member_id) for member_id in member_ids]
-    )
+        if not members:
+            await interaction.followup.send("❌ 対象ユーザーまたはロールが見つかりません。", ephemeral=True)
+            return
 
-    conn.commit()
-    conn.close()
+        member_ids = [m.id for m in members]
+
+        def _subtract_balance_sync(member_ids, amt, db_path):
+            conn = None
+            try:
+                conn = sqlite3.connect(db_path, timeout=30)
+                conn.execute("PRAGMA journal_mode=WAL;")
+                cur = conn.cursor()
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id INTEGER PRIMARY KEY,
+                        balance INTEGER DEFAULT 0,
+                        total_received INTEGER DEFAULT 0,
+                        total_spent INTEGER DEFAULT 0
+                    )
+                """)
+                cur.executemany("INSERT OR IGNORE INTO users (user_id) VALUES (?)", [(uid,) for uid in member_ids])
+                cur.executemany(
+                    "UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?",
+                    [(amt, amt, uid) for uid in member_ids]
+                )
+                conn.commit()
+                return len(member_ids)
+            except Exception as e:
+                print(f"[payment._subtract_balance_sync] error: {e}")
+                return 0
+            finally:
+                if conn:
+                    conn.close()
+
+        subbed_count = await db.execute(_subtract_balance_sync, member_ids, amount, DB_PATH)
+
+        if not subbed_count:
+            await interaction.followup.send("⚠️ データベース処理に失敗しました。", ephemeral=True)
+            return
+
+        target_name = members[0].display_name if len(members) == 1 else f"{len(members)} 人のメンバー"
+        await interaction.followup.send(f"💸 {target_name} から **{amount:,} Raruin** を減算しました。")
+    except Exception as e:
+        print(f"[payment] error: {e}")
+        try:
+            await interaction.followup.send("⚠️ エラーが発生しました。", ephemeral=True)
+        except:
+            pass
+
 
 
 
