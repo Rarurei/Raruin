@@ -1142,6 +1142,7 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
+# 通話参加で1分ごとに12Raruin付与
 @tasks.loop(minutes=1)
 async def voice_check():
     for guild in bot.guilds:
