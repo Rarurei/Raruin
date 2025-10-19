@@ -1,4 +1,5 @@
-# ====== 修正版ブロック（これを該当箇所と置き換えてください） ======
+# main.py
+# 必要: discord.py==2.4.0, python-dotenv==1.0.1, Flask==3.0.3, aiohttp==3.9.5
 
 import os
 import sqlite3
@@ -6,169 +7,139 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
+from datetime import datetime
 from flask import Flask
 from threading import Thread
 import asyncio
-import requests
 
-# 環境変数読み込み（1回で十分）
+# ===== 環境変数 =====
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+load_dotenv()
 
-# 永続 DB のパス（Render の Persistent Disk を /data にマウントする想定）
-DB_PATH = os.getenv("DB_PATH", "/data/main.db")
+# 👇この行を追加（あなたのDiscord IDに変える）
+OWNER_ID = 1402613707527426131  # ここに自分のDiscordユーザーIDを入れる
+load_dotenv()
 
-# 管理者（OWNER）のDiscord ID（必要に応じて変更）
-OWNER_ID = int(os.getenv("OWNER_ID", "1402613707527426131"))
 
-# --- データベースバックアップ復元元（Discord上のURLなど） ---
-BACKUP_DB_URL = os.getenv(
-    "BACKUP_DB_URL",
-    "https://cdn.discordapp.com/attachments/123456789012345678/987654321098765432/main.db"
+
+
+# データベース接続
+conn = sqlite3.connect("database.db")
+c = conn.cursor()
+
+conn = sqlite3.connect("main.db")
+c = conn.cursor()
+
+# ---------- 必要なテーブルを自動作成 ----------
+c.execute('''
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    balance INTEGER DEFAULT 0,
+    total_received INTEGER DEFAULT 0,
+    total_spent INTEGER DEFAULT 0
 )
+''')
 
-# バックアップ送信先チャンネルID（int）
-BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "1426803407360098365"))
+c.execute('''
+CREATE TABLE IF NOT EXISTS admins (
+    user_id INTEGER PRIMARY KEY
+)
+''')
+conn.commit()
 
-# ---------- Discord Bot 初期化 ----------
+
+c.execute('''
+CREATE TABLE IF NOT EXISTS shops (
+    shop_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE
+)
+''')
+
+c.execute('''
+CREATE TABLE IF NOT EXISTS shop_items (
+    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shop_id INTEGER,
+    name TEXT,
+    description TEXT,
+    price INTEGER,
+    stock TEXT,
+    role_id INTEGER,
+    role_duration INTEGER
+)
+''')
+
+c.execute('''
+CREATE TABLE IF NOT EXISTS gamble_settings (
+    id INTEGER PRIMARY KEY,
+    probability_level INTEGER DEFAULT 3
+)
+''')
+
+# --- データベース初期化 ---
+conn = sqlite3.connect("main.db")
+c = conn.cursor()
+
+# --- ユーザーデータ（残高など） ---
+c.execute('''
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    balance INTEGER DEFAULT 0,
+    total_received INTEGER DEFAULT 0,
+    total_spent INTEGER DEFAULT 0,
+    daily_streak INTEGER DEFAULT 0,
+    last_daily TEXT
+)
+''')
+
+# --- ショップ ---
+c.execute('''
+CREATE TABLE IF NOT EXISTS shops (
+    shop_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE
+)
+''')
+
+# --- 商品 ---
+c.execute('''
+CREATE TABLE IF NOT EXISTS shop_items (
+    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shop_id INTEGER,
+    name TEXT,
+    description TEXT,
+    price INTEGER,
+    stock TEXT,
+    role_id INTEGER,
+    role_duration INTEGER,
+    FOREIGN KEY (shop_id) REFERENCES shops(shop_id)
+)
+''')
+
+conn.commit()
+
+# 初期データ（ギャンブル設定）
+c.execute("INSERT OR IGNORE INTO gamble_settings (id, probability_level) VALUES (1, 3)")
+
+# 管理者を登録
+c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (OWNER_ID,))
+
+conn.commit()
+
+
+# ===== Discord Bot 設定 =====
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 tree = bot.tree
 
-# ----- 起動時: DB の格納ディレクトリがなければ作る -----
-db_dir = os.path.dirname(DB_PATH) or "/"
-try:
-    if db_dir and not os.path.exists(db_dir):
-        os.makedirs(db_dir, exist_ok=True)
-except Exception as e:
-    print(f"⚠️ DB ディレクトリ作成に失敗: {e}")
+# ===== ユーティリティ =====
+def is_admin(user_id: int) -> bool:
+    c.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,))
+    return c.fetchone() is not None
 
-# ----- 起動時: DB がなければ外部から復元を試みる -----
-if not os.path.exists(DB_PATH):
-    try:
-        print(f"⚠️ DB({DB_PATH}) が見つかりません。バックアップURLから復元を試みます…")
-        r = requests.get(BACKUP_DB_URL, timeout=15)
-        r.raise_for_status()
-        with open(DB_PATH, "wb") as f:
-            f.write(r.content)
-        print(f"✅ DB を復元しました: {DB_PATH}")
-    except Exception as e:
-        print(f"❌ DB の復元に失敗しました: {e}  — 続行します（新規 DB を作成します）")
-
-# --- 定期バックアップタスク（定義のみ。開始は on_ready() で行う） ---
-@tasks.loop(hours=24)
-async def backup_database():
-    try:
-        channel = bot.get_channel(BACKUP_CHANNEL_ID)
-        if channel:
-            if os.path.exists(DB_PATH):
-                await channel.send(file=discord.File(DB_PATH))
-                print("✅ DB をバックアップチャンネルに送信しました。")
-            else:
-                print("⚠️ バックアップ: DB ファイルが見つかりません。送信をスキップします。")
-        else:
-            print("⚠️ バックアップ: 指定されたチャンネルが見つかりません。")
-    except Exception as e:
-        print(f"[backup_database] エラー: {e}")
-
-@backup_database.before_loop
-async def before_backup():
-    # bot が準備できるまで待機（安全策）
-    await bot.wait_until_ready()
-
-# 重要: モジュール読み込み時に start() は呼ばない（イベントループが無いと例外になる）
-# backup_database.start()  # <- 呼ばないこと
-
-# --- SQLite メイン接続（グローバルに一つだけ作る） ---
-# check_same_thread=False は異なるスレッドからの使用を許可しますが、共有接続の運用は注意が必要です。
-try:
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys = ON;")
-    c = conn.cursor()
-    print(f"✅ DB に接続しました: {DB_PATH}")
-except Exception as e:
-    print(f"[DB] 接続時にエラーが発生しました ({DB_PATH}): {e}")
-    conn = None
-    c = None
-
-# ---------- 必要なテーブルを自動作成 ----------
-if c:
-    # users（基本）
-    c.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        balance INTEGER DEFAULT 0,
-        total_received INTEGER DEFAULT 0,
-        total_spent INTEGER DEFAULT 0,
-        daily_streak INTEGER DEFAULT 0,
-        last_daily TEXT
-    )
-    ''')
-
-    # admins
-    c.execute('''
-    CREATE TABLE IF NOT EXISTS admins (
-        user_id INTEGER PRIMARY KEY
-    )
-    ''')
-
-    # shops
-    c.execute('''
-    CREATE TABLE IF NOT EXISTS shops (
-        shop_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT UNIQUE
-    )
-    ''')
-
-    # shop_items
-    c.execute('''
-    CREATE TABLE IF NOT EXISTS shop_items (
-        item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        shop_id INTEGER,
-        name TEXT,
-        description TEXT,
-        price INTEGER,
-        stock TEXT,
-        role_id INTEGER,
-        role_duration INTEGER,
-        FOREIGN KEY (shop_id) REFERENCES shops(shop_id)
-    )
-    ''')
-
-    # gamble_settings
-    c.execute('''
-    CREATE TABLE IF NOT EXISTS gamble_settings (
-        id INTEGER PRIMARY KEY,
-        probability_level INTEGER DEFAULT 3
-    )
-    ''')
-
-    # purchase_history
-    c.execute('''
-    CREATE TABLE IF NOT EXISTS purchase_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        shop_name TEXT,
-        item_name TEXT,
-        price INTEGER,
-        timestamp TEXT
-    )
-    ''')
-
-    # 初期データ（ギャンブル設定、管理者登録など）
-    c.execute("INSERT OR IGNORE INTO gamble_settings (id, probability_level) VALUES (1, 3)")
-    try:
-        c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (OWNER_ID,))
-    except Exception:
-        pass
-
+def add_user_if_not_exists(user_id: int):
+    c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
     conn.commit()
-else:
-    print("⚠️ DBカーソルが利用できません。テーブル作成をスキップしました。")
-
-# ===== Discord Bot 設定（bot, tree は既に定義済み） =====
 
 # ===== Flask keep_alive =====
 app = Flask(__name__)
@@ -179,36 +150,13 @@ def home():
 
 def run_flask():
     print("🌐 Flaskサーバー起動: ポート8080で待機中…")
-    try:
-        app.run(host='0.0.0.0', port=8080)
-    except Exception as e:
-        print(f"Flask 起動エラー: {e}")
+    app.run(host='0.0.0.0', port=8080)
 
-# デーモンスレッドで起動（プロセス終了時に自動終了）
-Thread(target=run_flask, daemon=True).start()
+Thread(target=run_flask).start()
 
-# ---------- on_ready でタスクを安全に開始 ----------
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    print(f"Guilds: {[g.name for g in bot.guilds]}")
-    # コマンド同期（必要なら）
-    try:
-        await tree.sync()
-    except Exception as e:
-        print(f"[on_ready] tree.sync error: {e}")
 
-    # backup_database はここで安全に開始する（重複起動を防ぐ）
-    try:
-        if not backup_database.is_running():
-            backup_database.start()
-            print("backup_database task started.")
-    except Exception as e:
-        print(f"[on_ready] backup_database start error: {e}")
 
-    print("Background tasks started.")
 
-# ====== 修正版ブロック 終了 ======
 
 # ---------- Part 2: 管理者コマンドと通貨操作 ----------
 
@@ -344,39 +292,6 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
     return partial[:50]
 
 
-# ヘルパー: 入力からロールオブジェクトを探す（resolve_target_members が見つけられなかった場合の補助）
-def _find_role_from_input(raw: str, guild: discord.Guild) -> Optional[discord.Role]:
-    if not guild:
-        return None
-    s = raw.strip()
-    # mention形式
-    m = re.match(r'^<@&(?P<id>\d+)>$', s)
-    if m:
-        return guild.get_role(int(m.group("id")))
-    # idのみ
-    if s.isdigit():
-        r = guild.get_role(int(s))
-        if r:
-            return r
-    # @で始まる名前（半角/全角@許容）
-    name = s.lstrip("@\uFF20").strip()
-    if name:
-        # 完全一致
-        role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
-        if role:
-            return role
-        # 先頭一致 -> 部分一致
-        starts = [r for r in guild.roles if r.name.lower().startswith(name.lower())]
-        if starts:
-            return starts[0]
-        contains = [r for r in guild.roles if name.lower() in r.name.lower()]
-        if contains:
-            return contains[0]
-    # 最終手段: プレーン文字列をロール名として探す（完全一致）
-    role = discord.utils.find(lambda r: r.name.lower() == s.lower(), guild.roles)
-    return role
-
-
 # ---------- /配布（付与）（修正版：ロール存在チェックとDB安全化含む） ----------
 @tree.command(name="配布", description="指定したユーザーやロールにRaruinを付与（管理者専用）")
 @app_commands.describe(target="ユーザー（@で指定可）またはロール名/ID/ユーザー名", amount="付与額")
@@ -391,19 +306,13 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
 
     members = await resolve_target_members(target, interaction)
 
-    # members が空なら、改めて「ロールとして存在するか」をチェックしてユーザ向けメッセージを出す
-    if not members:
-        # guild が存在するか確認
-        guild = interaction.guild
-        if guild:
-            role_obj = _find_role_from_input(target, guild)
-            if role_obj:
-                # ロールは見つかったがメンバー0 のケース
-                if len(role_obj.members) == 0:
-                    await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
-                    return
-                # ロールにはメンバーがいる（resolve が失敗していた可能性） -> そのメンバーを使う
-                members = role_obj.members
+    # ロールだがメンバーがいないケースの通知
+    if (target.strip().startswith("@") or target.strip().startswith("＠")):
+        name = target.strip().lstrip("@\uFF20").strip()
+        role_obj = discord.utils.find(lambda r: r.name.lower() == name.lower(), interaction.guild.roles)
+        if role_obj and len(role_obj.members) == 0:
+            await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
+            return
 
     if not members:
         await interaction.response.send_message("❌ 対象が見つかりませんでした。@メンション / ID / ロール名 / ユーザー名 を試してください。", ephemeral=True)
@@ -431,7 +340,6 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
         name = f"{len(members)} 件のメンバー"
     await interaction.response.send_message(f"🎁 {name} に {amount} Raruin を付与しました。")
 
-
 # ---------- /支払い（減算）（修正版：ロール存在チェックとDB安全化含む） ----------
 @tree.command(name="支払い", description="指定したユーザーやロールのRaruinを減らす（管理者専用）")
 @app_commands.describe(target="ユーザー（@で指定可）またはロール名/ID/ユーザー名", amount="減らす額")
@@ -446,16 +354,14 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
 
     members = await resolve_target_members(target, interaction)
 
-    # members が空ならロール存在チェック（改善）
-    if not members:
-        guild = interaction.guild
-        if guild:
-            role_obj = _find_role_from_input(target, guild)
-            if role_obj:
-                if len(role_obj.members) == 0:
-                    await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
-                    return
-                members = role_obj.members
+    # 追加チェック：もし target が @... 形式でロール名にマッチしたがメンバー0の場合は明示する
+    if (target.strip().startswith("@") or target.strip().startswith("＠")):
+        # ロールオブジェクトだけ確かめたい場合
+        name = target.strip().lstrip("@\uFF20").strip()
+        role_obj = discord.utils.find(lambda r: r.name.lower() == name.lower(), interaction.guild.roles)
+        if role_obj and len(role_obj.members) == 0:
+            await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
+            return
 
     if not members:
         await interaction.response.send_message("❌ 対象が見つかりませんでした。@メンション / ID / ロール名 / ユーザー名 を試してください。", ephemeral=True)
@@ -1155,7 +1061,6 @@ async def voice_check():
                           (12, 12, member.id))
     conn.commit()
 
-
 # ---------- ヘルパー関数 ----------
 def get_probability():
     c.execute("SELECT probability_level FROM gamble_settings WHERE id=1")
@@ -1552,3 +1457,4 @@ async def main():
 # 実行
 if __name__ == "__main__":
     asyncio.run(main())
+
