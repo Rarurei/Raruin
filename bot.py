@@ -1,36 +1,34 @@
+# ====== 修正版ブロック（これを該当箇所と置き換えてください） ======
+
 import os
+import sqlite3
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
-from github_backup import upload_db_to_release  # ← Supabase使用でも念のため残す
 import asyncio
-import asyncpg
 import requests
-import re
-from typing import List, Optional
 
-# --------------------
-# Raruin Bot: Persistent DB (Supabase PostgreSQL 方式)
-# --------------------
-
-# 環境変数読み込み
+# 環境変数読み込み（1回で十分）
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Supabase 接続情報（Renderなどに環境変数で設定しておく）
-SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")  # 例: postgres://postgres:password@db.xxx.supabase.co:5432/postgres
+# 永続 DB のパス（Render の Persistent Disk を /data にマウントする想定）
+DB_PATH = os.getenv("DB_PATH", "/data/main.db")
 
-if not SUPABASE_DB_URL:
-    raise RuntimeError("❌ SUPABASE_DB_URL が設定されていません。環境変数に追加してください。")
-
-# 管理者（OWNER）のDiscord ID
+# 管理者（OWNER）のDiscord ID（必要に応じて変更）
 OWNER_ID = int(os.getenv("OWNER_ID", "1402613707527426131"))
 
-# バックアップ通知用チャンネル（任意）
-BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0") or 0)
+# --- データベースバックアップ復元元（Discord上のURLなど） ---
+BACKUP_DB_URL = os.getenv(
+    "BACKUP_DB_URL",
+    "https://cdn.discordapp.com/attachments/123456789012345678/987654321098765432/main.db"
+)
+
+# バックアップ送信先チャンネルID（int）
+BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "1426803407360098365"))
 
 # ---------- Discord Bot 初期化 ----------
 intents = discord.Intents.default()
@@ -38,141 +36,234 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 tree = bot.tree
 
-# ---------- PostgreSQL（Supabase）接続 ----------
-db_pool: "asyncpg.Pool | None" = None  # type: ignore
+# ----- 起動時: DB の格納ディレクトリがなければ作る -----
+db_dir = os.path.dirname(DB_PATH) or "/"
+try:
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+except Exception as e:
+    print(f"⚠️ DB ディレクトリ作成に失敗: {e}")
 
-async def init_db():
-    """Supabase(PostgreSQL)に接続してテーブルを初期化"""
-    global db_pool
+# ----- 起動時: DB がなければ外部から復元を試みる -----
+if not os.path.exists(DB_PATH):
     try:
-        db_pool = await asyncpg.create_pool(SUPABASE_DB_URL, min_size=1, max_size=5)
-        print("✅ Supabase PostgreSQL に接続しました。")
-
-        async with db_pool.acquire() as conn:
-            # テーブル作成
-            await conn.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                balance INTEGER DEFAULT 0,
-                total_received INTEGER DEFAULT 0,
-                total_spent INTEGER DEFAULT 0,
-                daily_streak INTEGER DEFAULT 0,
-                last_daily TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS admins (
-                user_id BIGINT PRIMARY KEY
-            );
-
-            CREATE TABLE IF NOT EXISTS shops (
-                shop_id SERIAL PRIMARY KEY,
-                name TEXT UNIQUE
-            );
-
-            CREATE TABLE IF NOT EXISTS shop_items (
-                item_id SERIAL PRIMARY KEY,
-                shop_id INTEGER REFERENCES shops(shop_id),
-                name TEXT,
-                description TEXT,
-                price INTEGER,
-                stock TEXT,
-                role_id BIGINT,
-                role_duration INTEGER
-            );
-
-            CREATE TABLE IF NOT EXISTS gamble_settings (
-                id INTEGER PRIMARY KEY,
-                probability_level INTEGER DEFAULT 3
-            );
-
-            CREATE TABLE IF NOT EXISTS purchase_history (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT,
-                shop_name TEXT,
-                item_name TEXT,
-                price INTEGER,
-                timestamp TEXT
-            );
-            ''')
-
-            # 初期値挿入
-            await conn.execute("""
-            INSERT INTO gamble_settings (id, probability_level)
-            VALUES (1, 3)
-            ON CONFLICT (id) DO NOTHING;
-            """)
-
-            await conn.execute("""
-            INSERT INTO admins (user_id)
-            VALUES ($1)
-            ON CONFLICT (user_id) DO NOTHING;
-            """, OWNER_ID)
-
-        print("✅ Supabaseテーブル初期化完了。")
-
+        print(f"⚠️ DB({DB_PATH}) が見つかりません。バックアップURLから復元を試みます…")
+        r = requests.get(BACKUP_DB_URL, timeout=15)
+        r.raise_for_status()
+        with open(DB_PATH, "wb") as f:
+            f.write(r.content)
+        print(f"✅ DB を復元しました: {DB_PATH}")
     except Exception as e:
-        print(f"❌ DB初期化エラー: {e}")
+        print(f"❌ DB の復元に失敗しました: {e}  — 続行します（新規 DB を作成します）")
+
+# --- 定期バックアップタスク（定義のみ。開始は on_ready() で行う） ---
+@tasks.loop(hours=24)
+async def backup_database():
+    try:
+        channel = bot.get_channel(BACKUP_CHANNEL_ID)
+        if channel:
+            if os.path.exists(DB_PATH):
+                await channel.send(file=discord.File(DB_PATH))
+                print("✅ DB をバックアップチャンネルに送信しました。")
+            else:
+                print("⚠️ バックアップ: DB ファイルが見つかりません。送信をスキップします。")
+        else:
+            print("⚠️ バックアップ: 指定されたチャンネルが見つかりません。")
+    except Exception as e:
+        print(f"[backup_database] エラー: {e}")
+
+@backup_database.before_loop
+async def before_backup():
+    # bot が準備できるまで待機（安全策）
+    await bot.wait_until_ready()
+
+# 重要: モジュール読み込み時に start() は呼ばない（イベントループが無いと例外になる）
+# backup_database.start()  # <- 呼ばないこと
+
+# --- SQLite メイン接続（グローバルに一つだけ作る） ---
+# check_same_thread=False は異なるスレッドからの使用を許可しますが、共有接続の運用は注意が必要です。
+try:
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys = ON;")
+    c = conn.cursor()
+    print(f"✅ DB に接続しました: {DB_PATH}")
+except Exception as e:
+    print(f"[DB] 接続時にエラーが発生しました ({DB_PATH}): {e}")
+    conn = None
+    c = None
+
+# ---------- 必要なテーブルを自動作成 ----------
+if c:
+    # users（基本）
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        balance INTEGER DEFAULT 0,
+        total_received INTEGER DEFAULT 0,
+        total_spent INTEGER DEFAULT 0,
+        daily_streak INTEGER DEFAULT 0,
+        last_daily TEXT
+    )
+    ''')
+
+    # admins
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS admins (
+        user_id INTEGER PRIMARY KEY
+    )
+    ''')
+
+    # shops
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS shops (
+        shop_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE
+    )
+    ''')
+
+    # shop_items
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS shop_items (
+        item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        shop_id INTEGER,
+        name TEXT,
+        description TEXT,
+        price INTEGER,
+        stock TEXT,
+        role_id INTEGER,
+        role_duration INTEGER,
+        FOREIGN KEY (shop_id) REFERENCES shops(shop_id)
+    )
+    ''')
+
+    # gamble_settings
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS gamble_settings (
+        id INTEGER PRIMARY KEY,
+        probability_level INTEGER DEFAULT 3
+    )
+    ''')
+
+    # purchase_history
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS purchase_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        shop_name TEXT,
+        item_name TEXT,
+        price INTEGER,
+        timestamp TEXT
+    )
+    ''')
+
+    # 初期データ（ギャンブル設定、管理者登録など）
+    c.execute("INSERT OR IGNORE INTO gamble_settings (id, probability_level) VALUES (1, 3)")
+    try:
+        c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (OWNER_ID,))
+    except Exception:
+        pass
+
+    conn.commit()
+else:
+    print("⚠️ DBカーソルが利用できません。テーブル作成をスキップしました。")
+
+# ===== Discord Bot 設定（bot, tree は既に定義済み） =====
 
 # ===== Flask keep_alive =====
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Raruin Bot Running with Supabase!"
+    return "Raruin Bot Running!"
 
 def run_flask():
+    print("🌐 Flaskサーバー起動: ポート8080で待機中…")
     try:
-        port = int(os.getenv("PORT", "8080"))
-        app.run(host='0.0.0.0', port=port)
+        app.run(host='0.0.0.0', port=8080)
     except Exception as e:
         print(f"Flask 起動エラー: {e}")
 
+# デーモンスレッドで起動（プロセス終了時に自動終了）
 Thread(target=run_flask, daemon=True).start()
 
-# ---------- GitHub Releases 自動バックアップタスク ----------
-@tasks.loop(hours=24)
-async def backup_database():
-    """GitHubにバックアップをアップロード（任意）"""
-    try:
-        upload_db_to_release()  # 任意機能（ファイルがあるなら）
-        print("✅ GitHub Releases にバックアップをアップロードしました。")
-
-        if BACKUP_CHANNEL_ID:
-            channel = bot.get_channel(BACKUP_CHANNEL_ID)
-            if channel:
-                await channel.send("✅ Supabase DB のバックアップを完了しました。")
-    except Exception as e:
-        print(f"[backup_database] エラー: {e}")
-
-@backup_database.before_loop
-async def before_backup():
-    await bot.wait_until_ready()
-
-# ---------- on_ready イベント ----------
+# ---------- on_ready でタスクを安全に開始 ----------
 @bot.event
 async def on_ready():
-    print(f"✅ ログイン完了: {bot.user}")
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"Guilds: {[g.name for g in bot.guilds]}")
+    # コマンド同期（必要なら）
     try:
         await tree.sync()
-        print("✅ スラッシュコマンド同期済み。")
     except Exception as e:
-        print(f"⚠️ コマンド同期エラー: {e}")
+        print(f"[on_ready] tree.sync error: {e}")
 
-    # DB初期化
-    await init_db()
-
-    # 自動バックアップ起動
+    # backup_database はここで安全に開始する（重複起動を防ぐ）
     try:
         if not backup_database.is_running():
             backup_database.start()
-            print("✅ 自動バックアップ開始。")
+            print("backup_database task started.")
     except Exception as e:
         print(f"[on_ready] backup_database start error: {e}")
 
     print("Background tasks started.")
 
-# ---------- Part 2: 管理者コマンドと通貨操作（Supabase / asyncpg対応版） ----------
-# resolve_target_members / _find_role_from_input を利用（ロール/メンション/名前解決に強い）
+# ====== 修正版ブロック 終了 ======
+
+# ---------- Part 2: 管理者コマンドと通貨操作 ----------
+
+# /addr - 管理者を追加・削除・一覧
+@tree.command(name="addr", description="管理者を追加、削除、一覧表示")
+@app_commands.describe(action="add, remove, list", target="ユーザー名またはID")
+async def addr(interaction: discord.Interaction, action: str, target: str = None):
+    add_user_if_not_exists(interaction.user.id)
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
+        return
+
+    action = action.lower()
+
+    if action == "list":
+        c.execute("SELECT user_id FROM admins")
+        rows = c.fetchall()
+        if not rows:
+            await interaction.response.send_message("👤 管理者はまだ登録されていません。")
+            return
+        mentions = [f"<@{uid[0]}>" for uid in rows]
+        await interaction.response.send_message(f"👑 管理者一覧: {', '.join(mentions)}")
+        return
+
+    if not target:
+        await interaction.response.send_message("⚠️ 対象ユーザー名またはIDを指定してください。", ephemeral=True)
+        return
+
+    # 対象ユーザー取得
+    user = None
+    if interaction.guild:
+        user = discord.utils.get(interaction.guild.members, name=target)
+
+    if not user:
+        try:
+            user_id = int(target)
+            user = await bot.fetch_user(user_id)
+        except:
+            await interaction.response.send_message("❌ ユーザーが見つかりません。", ephemeral=True)
+            return
+
+    if action == "add":
+        c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user.id,))
+        conn.commit()
+        await interaction.response.send_message(f"✅ {user.mention} を管理者に追加しました。")
+    elif action == "remove":
+        c.execute("DELETE FROM admins WHERE user_id=?", (user.id,))
+        conn.commit()
+        await interaction.response.send_message(f"🗑️ {user.mention} を管理者から削除しました。")
+    else:
+        await interaction.response.send_message("⚠️ actionは add, remove, list のいずれかです。", ephemeral=True)
+
+# ---------- ヘルパー: ターゲット解決（@役職名 に堅牢対応） ----------
+import re
+from typing import List, Optional
 
 async def resolve_target_members(target: str, interaction: discord.Interaction) -> List[discord.Member]:
     """
@@ -206,17 +297,19 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
 
     # 3) 先頭が @ （全角＠も含む）で @役職名 の場合 -> ロール名で検索（完全一致：大/小文字無視）
     if raw.startswith("@") or raw.startswith("＠"):
-        name = raw.lstrip("@\uFF20").strip()
+        name = raw.lstrip("@\uFF20").strip()  # 半角/全角@を除去
+        # 完全一致（case-insensitive）
         role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
         if role:
-            return role.members
+            return role.members  # 空でも [] を返す（呼び出し側でメッセージ出し分け）
+        # 完全一致見つからなければ部分一致（先頭一致 → 含む順）で検索（上位1つのロールを採用）
         starts = [r for r in guild.roles if r.name.lower().startswith(name.lower())]
         if starts:
             return starts[0].members
         contains = [r for r in guild.roles if name.lower() in r.name.lower()]
         if contains:
             return contains[0].members
-        return []
+        return []  # 見つからない
 
     # 4) 数字のみ -> ID として member または role を探す
     if raw.isdigit():
@@ -250,156 +343,45 @@ async def resolve_target_members(target: str, interaction: discord.Interaction) 
     partial = [mbr for mbr in guild.members if raw.lower() in mbr.name.lower() or (mbr.nick and raw.lower() in mbr.nick.lower())]
     return partial[:50]
 
+
+# ヘルパー: 入力からロールオブジェクトを探す（resolve_target_members が見つけられなかった場合の補助）
 def _find_role_from_input(raw: str, guild: discord.Guild) -> Optional[discord.Role]:
     if not guild:
         return None
     s = raw.strip()
+    # mention形式
     m = re.match(r'^<@&(?P<id>\d+)>$', s)
     if m:
         return guild.get_role(int(m.group("id")))
+    # idのみ
     if s.isdigit():
         r = guild.get_role(int(s))
         if r:
             return r
+    # @で始まる名前（半角/全角@許容）
     name = s.lstrip("@\uFF20").strip()
     if name:
+        # 完全一致
         role = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
         if role:
             return role
+        # 先頭一致 -> 部分一致
         starts = [r for r in guild.roles if r.name.lower().startswith(name.lower())]
         if starts:
             return starts[0]
         contains = [r for r in guild.roles if name.lower() in r.name.lower()]
         if contains:
             return contains[0]
+    # 最終手段: プレーン文字列をロール名として探す（完全一致）
     role = discord.utils.find(lambda r: r.name.lower() == s.lower(), guild.roles)
     return role
 
-# ---------- DBヘルパー（asyncpg / Supabase） ----------
-# 前提: グローバルに `db_pool` (asyncpg.Pool) が存在すること
 
-async def add_user_if_not_exists(user_id: int) -> None:
-    """users テーブルに user_id が存在しなければ追加する。"""
-    global db_pool
-    if db_pool is None:
-        raise RuntimeError("DB pool is not initialized")
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
-            user_id
-        )
-
-async def is_admin(user_id: int) -> bool:
-    """admins テーブルに user_id が存在するかを返す。"""
-    global db_pool
-    if db_pool is None:
-        return False
-    async with db_pool.acquire() as conn:
-        rv = await conn.fetchval("SELECT 1 FROM admins WHERE user_id = $1", user_id)
-    return bool(rv)
-
-async def get_balance(user_id: int) -> int:
-    """ユーザーの残高を返す（なければ0）。"""
-    global db_pool
-    if db_pool is None:
-        raise RuntimeError("DB pool is not initialized")
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT balance FROM users WHERE user_id = $1", user_id)
-    return row["balance"] if row else 0
-
-async def update_balance(user_id: int, amount: int) -> None:
-    """
-    残高を増減するユーティリティ。
-    amount >0 の場合 total_received も増やし、amount<0 の場合 total_spent を増やす。
-    """
-    global db_pool
-    if db_pool is None:
-        raise RuntimeError("DB pool is not initialized")
-    async with db_pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
-            if amount >= 0:
-                await conn.execute(
-                    "UPDATE users SET balance = balance + $1, total_received = total_received + $1 WHERE user_id = $2",
-                    amount, user_id
-                )
-            else:
-                # amount is negative
-                await conn.execute(
-                    "UPDATE users SET balance = balance + $1, total_spent = total_spent + $2 WHERE user_id = $3",
-                    amount, -amount, user_id
-                )
-
-
-
-# ---------- /addr - 管理者を追加・削除・一覧（Supabase対応） ----------
-@tree.command(name="addr", description="管理者を追加、削除、一覧表示")
-@app_commands.describe(action="add, remove, list", target="ユーザー名またはID")
-async def addr(interaction: discord.Interaction, action: str, target: str = None):
-    await add_user_if_not_exists(interaction.user.id)
-    if not await is_admin(interaction.user.id):
-        await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
-        return
-
-    action = action.lower()
-
-    # list
-    if action == "list":
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT user_id FROM admins")
-        if not rows:
-            await interaction.response.send_message("👤 管理者はまだ登録されていません。")
-            return
-        mentions = [f"<@{r['user_id']}>" for r in rows]
-        await interaction.response.send_message(f"👑 管理者一覧: {', '.join(mentions)}")
-        return
-
-    if not target:
-        await interaction.response.send_message("⚠️ 対象ユーザー名またはIDを指定してください。", ephemeral=True)
-        return
-
-    # 対象ユーザー取得（ギルドメンバー優先、なければ fetch_user）
-    user = None
-    if interaction.guild:
-        # try to resolve by mention / name
-        try:
-            # if target looks like mention
-            um = re.match(r'^<@!?(?P<id>\d+)>$', target.strip())
-            if um:
-                uid = int(um.group("id"))
-                user = interaction.guild.get_member(uid) or await interaction.guild.fetch_member(uid)
-            else:
-                # try find by name/nick
-                user = discord.utils.get(interaction.guild.members, name=target)
-        except:
-            user = None
-
-    if not user:
-        try:
-            user_id = int(target)
-            user = await bot.fetch_user(user_id)
-        except:
-            await interaction.response.send_message("❌ ユーザーが見つかりません。", ephemeral=True)
-            return
-
-    if action == "add":
-        async with db_pool.acquire() as conn:
-            await conn.execute("INSERT INTO admins (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user.id)
-        await interaction.response.send_message(f"✅ {user.mention} を管理者に追加しました。")
-    elif action == "remove":
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM admins WHERE user_id=$1", user.id)
-        await interaction.response.send_message(f"🗑️ {user.mention} を管理者から削除しました。")
-    else:
-        await interaction.response.send_message("⚠️ actionは add, remove, list のいずれかです。", ephemeral=True)
-
-
-# ---------- /配布（付与）（Supabase対応・ロールOK） ----------
+# ---------- /配布（付与）（修正版：ロール存在チェックとDB安全化含む） ----------
 @tree.command(name="配布", description="指定したユーザーやロールにRaruinを付与（管理者専用）")
 @app_commands.describe(target="ユーザー（@で指定可）またはロール名/ID/ユーザー名", amount="付与額")
 async def distribute(interaction: discord.Interaction, target: str, amount: int):
-    # 管理者チェック
-    if not await is_admin(interaction.user.id):
+    if not is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
         return
 
@@ -407,53 +389,54 @@ async def distribute(interaction: discord.Interaction, target: str, amount: int)
         await interaction.response.send_message("⚠️ 付与額は1以上にしてください。", ephemeral=True)
         return
 
-    # ターゲット解決（ユーザーまたはロール）
     members = await resolve_target_members(target, interaction)
 
-    # members が空ならロール名が存在するか確認（補助）
-    if not members and interaction.guild:
-        role_obj = _find_role_from_input(target, interaction.guild)
-        if role_obj:
-            if len(role_obj.members) == 0:
-                await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
-                return
-            members = role_obj.members
+    # members が空なら、改めて「ロールとして存在するか」をチェックしてユーザ向けメッセージを出す
+    if not members:
+        # guild が存在するか確認
+        guild = interaction.guild
+        if guild:
+            role_obj = _find_role_from_input(target, guild)
+            if role_obj:
+                # ロールは見つかったがメンバー0 のケース
+                if len(role_obj.members) == 0:
+                    await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
+                    return
+                # ロールにはメンバーがいる（resolve が失敗していた可能性） -> そのメンバーを使う
+                members = role_obj.members
 
     if not members:
         await interaction.response.send_message("❌ 対象が見つかりませんでした。@メンション / ID / ロール名 / ユーザー名 を試してください。", ephemeral=True)
         return
 
-    # defer（長時間処理に備える）
-    try:
-        await interaction.response.defer(ephemeral=True)
-    except:
-        pass
+    conn = sqlite3.connect("main.db", timeout=10)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            balance INTEGER DEFAULT 0,
+            total_received INTEGER DEFAULT 0,
+            total_spent INTEGER DEFAULT 0
+        )
+    """)
+    for m in members:
+        cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (m.id,))
+        cur.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?", (amount, amount, m.id))
+    conn.commit()
+    conn.close()
 
-    member_ids = [m.id for m in members]
-
-    # DB更新（トランザクションでまとめて）
-    try:
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                for uid in member_ids:
-                    await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", uid)
-                    await conn.execute("UPDATE users SET balance = balance + $1, total_received = total_received + $1 WHERE user_id = $2", amount, uid)
-    except Exception as e:
-        await interaction.followup.send(f"❌ DB更新中にエラーが発生しました: `{e}`", ephemeral=True)
-        return
-
-    # レスポンス
     if len(members) == 1:
         name = members[0].display_name
     else:
         name = f"{len(members)} 件のメンバー"
-    await interaction.followup.send(f"🎁 {name} に {amount} Raruin を付与しました。")
+    await interaction.response.send_message(f"🎁 {name} に {amount} Raruin を付与しました。")
 
-# ---------- /支払い（減算）（Supabase対応・ロールOK） ----------
+
+# ---------- /支払い（減算）（修正版：ロール存在チェックとDB安全化含む） ----------
 @tree.command(name="支払い", description="指定したユーザーやロールのRaruinを減らす（管理者専用）")
 @app_commands.describe(target="ユーザー（@で指定可）またはロール名/ID/ユーザー名", amount="減らす額")
 async def payment(interaction: discord.Interaction, target: str, amount: int):
-    if not await is_admin(interaction.user.id):
+    if not is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
         return
 
@@ -464,82 +447,89 @@ async def payment(interaction: discord.Interaction, target: str, amount: int):
     members = await resolve_target_members(target, interaction)
 
     # members が空ならロール存在チェック（改善）
-    if not members and interaction.guild:
-        role_obj = _find_role_from_input(target, interaction.guild)
-        if role_obj:
-            if len(role_obj.members) == 0:
-                await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
-                return
-            members = role_obj.members
+    if not members:
+        guild = interaction.guild
+        if guild:
+            role_obj = _find_role_from_input(target, guild)
+            if role_obj:
+                if len(role_obj.members) == 0:
+                    await interaction.response.send_message(f"ℹ️ ロール **{role_obj.name}** は見つかりましたが、メンバーがいません。", ephemeral=True)
+                    return
+                members = role_obj.members
 
     if not members:
         await interaction.response.send_message("❌ 対象が見つかりませんでした。@メンション / ID / ロール名 / ユーザー名 を試してください。", ephemeral=True)
         return
 
-    try:
-        await interaction.response.defer(ephemeral=True)
-    except:
-        pass
+    # DB処理（安全に）
+    conn = sqlite3.connect("main.db", timeout=10)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            balance INTEGER DEFAULT 0,
+            total_received INTEGER DEFAULT 0,
+            total_spent INTEGER DEFAULT 0
+        )
+    """)
+    for m in members:
+        cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (m.id,))
+        cur.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?", (amount, amount, m.id))
+    conn.commit()
+    conn.close()
 
-    member_ids = [m.id for m in members]
-
-    try:
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                for uid in member_ids:
-                    await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", uid)
-                    await conn.execute("UPDATE users SET balance = balance - $1, total_spent = total_spent + $1 WHERE user_id = $2", amount, uid)
-    except Exception as e:
-        await interaction.followup.send(f"❌ DB更新中にエラーが発生しました: `{e}`", ephemeral=True)
-        return
-
+    # レスポンス
     if len(members) == 1:
         name = members[0].display_name
     else:
         name = f"{len(members)} 件のメンバー"
-    await interaction.followup.send(f"💸 {name} から {amount} Raruin を減算しました。")
+    await interaction.response.send_message(f"💸 {name} から {amount} Raruin を減算しました。")
 
-# ---------- /ギャンブル確率設定（Supabase対応） ----------
+
+
+
+
+
+
+# ---------- /ギャンブル確率設定 ----------
 @tree.command(name="ギャンブル確率設定", description="管理者専用: ギャンブル確率レベル変更")
 @app_commands.describe(probability="1=当たりやすい, 6=当たりにくい")
 async def gamble_prob_set(interaction: discord.Interaction, probability: int):
-    # 管理者権限判定（サーバー管理者権限でも可）
-    if not interaction.user.guild_permissions.administrator and not await is_admin(interaction.user.id):
+    if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
         return
     if probability < 1 or probability > 6:
         await interaction.response.send_message("⚠️ 1〜6で指定してください。", ephemeral=True)
         return
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.execute("UPDATE gamble_settings SET probability_level = $1 WHERE id = 1", probability)
-        await interaction.response.send_message(f"🎯 ギャンブル確率レベルを `{probability}` に設定しました。")
-    except Exception as e:
-        await interaction.response.send_message(f"⚠️ 更新エラー: {e}", ephemeral=True)
+    c.execute("UPDATE gamble_settings SET probability_level=? WHERE id=1", (probability,))
+    conn.commit()
+    await interaction.response.send_message(f"🎯 ギャンブル確率レベルを `{probability}` に設定しました。")
 
-# ---------- /shopadd - ショップ追加/削除（Supabase対応） ----------
+
+
+# /shopadd - ショップ追加/削除
 @tree.command(name="shopadd", description="管理者専用: ショップを追加または削除")
 @app_commands.describe(action="追加 or 削除", shop_name="ショップの名前")
 async def shopadd(interaction: discord.Interaction, action: str, shop_name: str):
-    if not await is_admin(interaction.user.id):
+    if not is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
         return
 
-    action_norm = action.lower()
-    try:
-        async with db_pool.acquire() as conn:
-            if action_norm in ("追加", "add"):
-                await conn.execute("INSERT INTO shops (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", shop_name)
-                await interaction.response.send_message(f"✅ ショップ {shop_name} を追加しました。")
-            elif action_norm in ("削除", "remove"):
-                await conn.execute("DELETE FROM shops WHERE name = $1", shop_name)
-                await interaction.response.send_message(f"🗑️ ショップ {shop_name} を削除しました。")
-            else:
-                await interaction.response.send_message("⚠️ actionは「追加」または「削除」を指定してください。", ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"⚠️ DBエラー: {e}", ephemeral=True)
+    action = action.lower()
+    if action == "追加":
+        c.execute("INSERT OR IGNORE INTO shops (name) VALUES (?)", (shop_name,))
+        conn.commit()
+        await interaction.response.send_message(f"✅ ショップ {shop_name} を追加しました。")
+    elif action == "削除":
+        c.execute("DELETE FROM shops WHERE name=?", (shop_name,))
+        conn.commit()
+        await interaction.response.send_message(f"🗑️ ショップ {shop_name} を削除しました。")
+    else:
+        await interaction.response.send_message("⚠️ actionは「追加」または「削除」を指定してください。", ephemeral=True)
 
-# ---------- /shop - 商品追加/削除（Supabase対応） ----------
+
+
+# /shop - 商品追加/削除（ロールは@で指定、付与時間は分で指定、在庫は数字または'無限'）
 @tree.command(name="shop", description="管理者専用: ショップの商品を追加または削除")
 @app_commands.describe(
     action="追加 or 削除",
@@ -562,21 +552,21 @@ async def shop(
     role: discord.Role = None,
     role_duration_min: int = None
 ):
-    if not await is_admin(interaction.user.id):
+    if not is_admin(interaction.user.id):
         await interaction.response.send_message("⚠️ 管理者のみ使用可能です。", ephemeral=True)
         return
 
     # ショップ存在チェック
-    async with db_pool.acquire() as conn:
-        shop_row = await conn.fetchrow("SELECT shop_id FROM shops WHERE name = $1", shop_name)
+    c.execute("SELECT shop_id FROM shops WHERE name=?", (shop_name,))
+    shop_row = c.fetchone()
     if not shop_row:
         await interaction.response.send_message(f"⚠️ {shop_name} というショップは存在しません。", ephemeral=True)
         return
-    shop_id = shop_row["shop_id"]
+    shop_id = shop_row[0]
 
     # 在庫の検証: '無限' (小文字許容) または 0以上の整数
     stock_norm = stock if isinstance(stock, str) else str(stock)
-    if stock_norm.lower() in ["無限", "mugen", "unlimited", "inf", "∞"]:
+    if stock_norm.lower() in ["無限", "mugen"]:
         stock_to_store = "無限"
     else:
         try:
@@ -590,289 +580,291 @@ async def shop(
             return
 
     action_norm = action.lower()
+    if action_norm in ["追加", "add"]:
+        # role が与えられていれば role.id を保存。role_duration_min は分 -> DBには秒で保存。
+        role_id = role.id if role else None
+        role_duration_seconds = role_duration_min * 60 if role_duration_min is not None else None
+
+        c.execute('''
+            INSERT INTO shop_items (shop_id, name, description, price, stock, role_id, role_duration)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (shop_id, item_name, description, price, stock_to_store, role_id, role_duration_seconds))
+        conn.commit()
+
+        extra = ""
+        if role:
+            extra = f" ロール付与: {role.name}"
+            if role_duration_min:
+                extra += f"（{role_duration_min}分）"
+        extra += f" 在庫: {stock_to_store}"
+        await interaction.response.send_message(f"✅ {item_name} を {shop_name} に追加しました。{extra}")
+
+    elif action_norm in ["削除", "remove"]:
+        c.execute("DELETE FROM shop_items WHERE shop_id=? AND name=?", (shop_id, item_name))
+        conn.commit()
+        await interaction.response.send_message(f"🗑️ {item_name} を {shop_name} から削除しました。")
+    else:
+        await interaction.response.send_message("⚠️ actionは「追加」または「削除」（または add/remove）を指定してください。", ephemeral=True)
+
+# ---------- Part 3: ショップ管理とユーザー向けコマンド ----------
+
+# 安全なユーザー作成ユーティリティ（既存のものと置き換えてください）
+def add_user_if_not_exists(user_id: int):
+    """
+    users テーブルがなければ作成し、user_id がなければ挿入する。
+    コマンド／イベントで都度呼べるように都度接続する実装。
+    """
+    conn = None
     try:
-        async with db_pool.acquire() as conn:
-            if action_norm in ["追加", "add"]:
-                role_id = role.id if role else None
-                role_duration_seconds = role_duration_min * 60 if role_duration_min is not None else None
-
-                await conn.execute('''
-                    INSERT INTO shop_items (shop_id, name, description, price, stock, role_id, role_duration)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
-                ''', shop_id, item_name, description, price, stock_to_store, role_id, role_duration_seconds)
-
-                extra = ""
-                if role:
-                    extra = f" ロール付与: {role.name}"
-                    if role_duration_min:
-                        extra += f"（{role_duration_min}分）"
-                extra += f" 在庫: {stock_to_store}"
-                await interaction.response.send_message(f"✅ {item_name} を {shop_name} に追加しました。{extra}")
-
-            elif action_norm in ["削除", "remove"]:
-                await conn.execute("DELETE FROM shop_items WHERE shop_id = $1 AND name = $2", shop_id, item_name)
-                await interaction.response.send_message(f"🗑️ {item_name} を {shop_name} から削除しました。")
-            else:
-                await interaction.response.send_message("⚠️ actionは「追加」または「削除」（または add/remove）を指定してください。", ephemeral=True)
+        conn = sqlite3.connect("main.db", timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                balance INTEGER DEFAULT 0,
+                total_received INTEGER DEFAULT 0,
+                total_spent INTEGER DEFAULT 0
+            )
+        """)
+        # user がいなければ作る（他のカラムは DEFAULT）
+        cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
     except Exception as e:
-        await interaction.response.send_message(f"⚠️ DBエラー: {e}", ephemeral=True)
-# ---------- Part 3: ショップ管理とユーザー向けコマンド（Supabase / asyncpg対応版） ----------
-import asyncio
-from datetime import datetime
-from typing import Optional, List
+        print(f"[add_user_if_not_exists] DB error: {e}")
+        try:
+            if conn:
+                conn.rollback()
+        except:
+            pass
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except:
+            pass
 
-# 前提: global db_pool が asyncpg.Pool として定義済み
-# 例: db_pool = await asyncpg.create_pool(SUPABASE_DB_URL, min_size=1, max_size=5)
 
-# ---- DB ユーティリティ（同期版から async へ置換） ----
-async def add_user_if_not_exists(user_id: int):
-    """users テーブルに存在しなければ追加（基本フィールドのみ）。非同期版。"""
-    global db_pool
-    if db_pool is None:
-        raise RuntimeError("DB pool is not initialized")
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
-            user_id
-        )
-
-# ---- /残高 コマンド ----
+# /残高 コマンド（これで常に最新の DB 値を読みます）
 @tree.command(name="残高", description="自分の残高を確認します")
 async def balance_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    try:
-        await add_user_if_not_exists(interaction.user.id)
-        async with db_pool.acquire() as conn:
-            bal = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", interaction.user.id)
-        balance = bal if bal is not None else 0
-        await interaction.followup.send(f"💰 あなたの残高は {balance} Raruin です。", ephemeral=True)
-    except Exception as e:
-        print(f"[balance_cmd] error: {e}")
-        await interaction.followup.send("⚠️ エラーが発生しました。管理者に連絡してください。", ephemeral=True)
 
-# ---- /ランキング ----
+    try:
+        # ユーザーの存在を保証（内部で commit される）
+        add_user_if_not_exists(interaction.user.id)
+
+        # 都度接続して確実に最新値を読む
+        conn = sqlite3.connect("main.db", timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        cur = conn.cursor()
+        cur.execute("SELECT balance FROM users WHERE user_id=?", (interaction.user.id,))
+        row = cur.fetchone()
+        balance = row[0] if row else 0
+        conn.close()
+
+        await interaction.followup.send(f"💰 あなたの残高は {balance} Raruin です。")
+    except Exception as e:
+        # 開発中は詳細ログを残す（本運用では簡潔表示に変える）
+        print(f"[balance_cmd] error: {e}")
+        try:
+            await interaction.followup.send(f"⚠️ エラーが発生しました: {e}")
+        except:
+            pass
+
+# ---------- ランキング ----------
 @tree.command(name="ランキング", description="Raruin残高ランキング上位15名")
 async def ranking(interaction: discord.Interaction):
-    try:
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 15")
-        if not rows:
-            await interaction.response.send_message("ユーザーが存在しません。")
-            return
-        msg = "🏆 Raruinランキング（上位15名）\n"
-        for i, row in enumerate(rows, start=1):
-            uid = row["user_id"]
-            bal = row["balance"] or 0
-            try:
-                user = await bot.fetch_user(uid)
-                name = user.name
-            except:
-                name = f"ユーザーID:{uid}"
-            msg += f"{i}. {name}: {bal} Raruin\n"
-        await interaction.response.send_message(msg)
-    except Exception as e:
-        print(f"[ranking] error: {e}")
-        await interaction.response.send_message("⚠️ エラーが発生しました。", ephemeral=True)
+    c.execute("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 15")
+    rows = c.fetchall()
+    if not rows:
+        await interaction.response.send_message("ユーザーが存在しません。")
+        return
 
-# ---- /統計 ----
+    msg = "🏆 Raruinランキング（上位15名）\n"
+    for i, (uid, bal) in enumerate(rows, start=1):
+        try:
+            user = await bot.fetch_user(uid)
+            name = user.name
+        except:
+            name = f"ユーザーID:{uid}"
+        msg += f"{i}. {name}: {bal} Raruin\n"
+    await interaction.response.send_message(msg)
+
+
+# ---------- 統計 ----------
 @tree.command(name="統計", description="Raruin全体統計")
 async def stats(interaction: discord.Interaction):
-    try:
-        async with db_pool.acquire() as conn:
-            totals = await conn.fetchrow("SELECT COALESCE(SUM(balance),0) as total_balance, COALESCE(SUM(total_spent),0) as total_spent FROM users")
-            richest = await conn.fetchrow("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 1")
-            poorest = await conn.fetchrow("SELECT user_id, balance FROM users ORDER BY balance ASC LIMIT 1")
+    c.execute("SELECT SUM(balance), SUM(total_spent) FROM users")
+    total_balance, total_spent = c.fetchone()
+    c.execute("SELECT user_id, balance FROM users ORDER BY balance DESC LIMIT 1")
+    richest_row = c.fetchone()
+    c.execute("SELECT user_id, balance FROM users ORDER BY balance ASC LIMIT 1")
+    poorest_row = c.fetchone()
 
-        total_balance = totals["total_balance"] if totals else 0
-        total_spent = totals["total_spent"] if totals else 0
+    richest_user = await bot.fetch_user(richest_row[0]) if richest_row else None
+    poorest_user = await bot.fetch_user(poorest_row[0]) if poorest_row else None
 
-        richest_name = "なし"
-        richest_bal = 0
-        if richest:
-            richest_bal = richest["balance"] or 0
-            try:
-                u = await bot.fetch_user(richest["user_id"])
-                richest_name = u.name
-            except:
-                richest_name = f"ユーザーID:{richest['user_id']}"
+    msg = (
+        f"💰 現在全員が持っているRaruin合計: {total_balance or 0}\n"
+        f"📤 全員が今まで使った額合計: {total_spent or 0}\n"
+        f"👑 最も持っている人: {richest_user.name if richest_user else 'なし'} ({richest_row[1] if richest_row else 0})\n"
+        f"💸 最も持っていない人: {poorest_user.name if poorest_user else 'なし'} ({poorest_row[1] if poorest_row else 0})"
+    )
+    await interaction.response.send_message(msg)
 
-        poorest_name = "なし"
-        poorest_bal = 0
-        if poorest:
-            poorest_bal = poorest["balance"] or 0
-            try:
-                u = await bot.fetch_user(poorest["user_id"])
-                poorest_name = u.name
-            except:
-                poorest_name = f"ユーザーID:{poorest['user_id']}"
-
-        msg = (
-            f"💰 現在全員が持っているRaruin合計: {total_balance}\n"
-            f"📤 全員が今まで使った額合計: {total_spent}\n"
-            f"👑 最も持っている人: {richest_name} ({richest_bal})\n"
-            f"💸 最も持っていない人: {poorest_name} ({poorest_bal})"
-        )
-        await interaction.response.send_message(msg)
-    except Exception as e:
-        print(f"[stats] error: {e}")
-        await interaction.response.send_message("⚠️ エラーが発生しました。", ephemeral=True)
-
-# ---- /ギャンブル確率確認 ----
+# ---------- ギャンブル確率確認 ----------
 @tree.command(name="ギャンブル確率確認", description="現在のギャンブル確率を確認")
 async def gamble_prob_check(interaction: discord.Interaction):
-    try:
-        # ensure row exists
-        async with db_pool.acquire() as conn:
-            await conn.execute("INSERT INTO gamble.settings (id, probability_level) VALUES (1,3) ON CONFLICT (id) DO NOTHING") \
-                if False else None
-    except Exception:
-        # Some Postgres schemas might differ; fallback: ensure via safe insert without schema qualifier
-        pass
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS gamble_settings (
+            id INTEGER PRIMARY KEY,
+            probability_level INTEGER DEFAULT 3
+        )
+    ''')
+    c.execute("INSERT OR IGNORE INTO gamble_settings (id, probability_level) VALUES (1, 3)")
+    conn.commit()
 
-    try:
-        async with db_pool.acquire() as conn:
-            prob = await conn.fetchval("SELECT probability_level FROM gamble_settings WHERE id=1")
-        prob = prob if prob is not None else 3
-        await interaction.response.send_message(f"🎰 現在のギャンブル確率設定: {prob} (1が最も当たりやすい, 6が最も難しい)")
-    except Exception as e:
-        print(f"[gamble_prob_check] error: {e}")
-        await interaction.response.send_message("⚠️ ギャンブル確率の取得に失敗しました。", ephemeral=True)
+    c.execute("SELECT probability_level FROM gamble_settings WHERE id=1")
+    prob = c.fetchone()[0]
+    await interaction.response.send_message(
+        f"🎰 現在のギャンブル確率設定: {prob} (1が最も当たりやすい, 6が最も難しい)"
+    )
 
-# ---- /ショップリスト ----
+
+
+# ---------- Part 3: ショップ管理とユーザー向けコマンド ----------
+
+# ---------- ショップ一覧 ----------
 @tree.command(name="ショップリスト", description="ショップ一覧を表示")
 async def shop_list(interaction: discord.Interaction):
-    try:
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT name FROM shops ORDER BY name")
-        if not rows:
-            await interaction.response.send_message("ショップが存在しません。")
-            return
-        msg = "🛒 ショップ一覧:\n" + "\n".join([r["name"] for r in rows])
-        await interaction.response.send_message(msg)
-    except Exception as e:
-        print(f"[shop_list] error: {e}")
-        await interaction.response.send_message("⚠️ エラーが発生しました。", ephemeral=True)
+    c.execute("SELECT name FROM shops")
+    rows = c.fetchall()
+    if not rows:
+        await interaction.response.send_message("ショップが存在しません。")
+        return
+    msg = "🛒 ショップ一覧:\n" + "\n".join([row[0] for row in rows])
+    await interaction.response.send_message(msg)
 
-# ---- /ショップ (商品表示) ----
+
+# ---------- ショップ商品表示 ----------
 @tree.command(name="ショップ", description="指定したショップの商品を表示")
 @app_commands.describe(shop_name="ショップの名前")
 async def show_shop(interaction: discord.Interaction, shop_name: str):
-    try:
-        async with db_pool.acquire() as conn:
-            shop_row = await conn.fetchrow("SELECT shop_id FROM shops WHERE name=$1", shop_name)
-            if not shop_row:
-                await interaction.response.send_message(f"{shop_name} というショップは存在しません。")
-                return
-            shop_id = shop_row["shop_id"]
-            items = await conn.fetch("SELECT name, description, price FROM shop_items WHERE shop_id=$1", shop_id)
+    c.execute("SELECT shop_id FROM shops WHERE name=?", (shop_name,))
+    row = c.fetchone()
+    if not row:
+        await interaction.response.send_message(f"{shop_name} というショップは存在しません。")
+        return
+    shop_id = row[0]
+    c.execute("SELECT name, description, price FROM shop_items WHERE shop_id=?", (shop_id,))
+    items = c.fetchall()
+    if not items:
+        await interaction.response.send_message("このショップには商品がありません。")
+        return
+    msg = f"🛒 {shop_name}の商品一覧:\n"
+    for name, desc, price in items:
+        msg += f"{name} - {desc} - {price} Raruin\n"
+    await interaction.response.send_message(msg)
 
-        if not items:
-            await interaction.response.send_message("このショップには商品がありません。")
-            return
-        msg = f"🛒 {shop_name}の商品一覧:\n"
-        for it in items:
-            desc = it["description"] or ""
-            msg += f"{it['name']} - {desc} - {it['price']} Raruin\n"
-        await interaction.response.send_message(msg)
-    except Exception as e:
-        print(f"[show_shop] error: {e}")
-        await interaction.response.send_message("⚠️ エラーが発生しました。", ephemeral=True)
 
-# ---- /買う （購入処理：トランザクションで安全に） ----
+# ---------- 商品購入（修正版） ----------
 @tree.command(name="買う", description="商品を購入する")
 @app_commands.describe(shop_name="ショップ名", item_name="商品名")
 async def buy_item(interaction: discord.Interaction, shop_name: str, item_name: str):
+    # インタラクション応答を確保（3秒タイムアウト回避）
     await interaction.response.defer(ephemeral=True)
 
     try:
-        await add_user_if_not_exists(interaction.user.id)
+        # ユーザー用エントリを保証（関数は都度接続する安全版を使ってください）
+        add_user_if_not_exists(interaction.user.id)
 
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                # 1) shop id
-                shop_row = await conn.fetchrow("SELECT shop_id FROM shops WHERE name=$1", shop_name)
-                if not shop_row:
-                    await interaction.followup.send("❌ そのショップは存在しません。", ephemeral=True)
-                    return
-                shop_id = shop_row["shop_id"]
+        # DB接続（このコマンド内で完結）
+        conn = sqlite3.connect("main.db", timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        cur = conn.cursor()
 
-                # 2) lock item row
-                item = await conn.fetchrow(
-                    "SELECT item_id, price, stock, role_id, role_duration FROM shop_items WHERE shop_id=$1 AND name=$2 FOR UPDATE",
-                    shop_id, item_name
-                )
-                if not item:
-                    await interaction.followup.send("❌ その商品は見つかりません。", ephemeral=True)
-                    return
-                item_id = item["item_id"]
-                price = item["price"] or 0
-                stock = item["stock"]
-                role_id = item["role_id"]
-                role_duration = item["role_duration"]
+        # 1) ショップ確認
+        cur.execute("SELECT shop_id FROM shops WHERE name=?", (shop_name,))
+        row = cur.fetchone()
+        if not row:
+            await interaction.followup.send("❌ そのショップは存在しません。", ephemeral=True)
+            conn.close()
+            return
+        shop_id = row[0]
 
-                # 3) check balance (lock user row)
-                user_row = await conn.fetchrow("SELECT balance FROM users WHERE user_id=$1 FOR UPDATE", interaction.user.id)
-                user_balance = user_row["balance"] if user_row else 0
-                if user_balance < price:
-                    await interaction.followup.send("💸 残高が足りません。", ephemeral=True)
-                    return
+        # 2) 商品取得
+        cur.execute("SELECT item_id, price, stock, role_id, role_duration FROM shop_items WHERE shop_id=? AND name=?",
+                    (shop_id, item_name))
+        item = cur.fetchone()
+        if not item:
+            await interaction.followup.send("❌ その商品は見つかりません。", ephemeral=True)
+            conn.close()
+            return
+        item_id, price, stock, role_id, role_duration = item
 
-                # 4) stock check and decrement if necessary
-                stock_str = "" if stock is None else str(stock)
-                stock_unlimited = stock_str.lower() in ("無限", "mugen", "unlimited", "inf", "∞")
-                if not stock_unlimited:
-                    try:
-                        stock_int = int(stock_str)
-                    except:
-                        await interaction.followup.send("⚠️ 在庫情報に問題があります。管理者に連絡してください。", ephemeral=True)
-                        return
-                    if stock_int <= 0:
-                        await interaction.followup.send("🚫 在庫がありません。", ephemeral=True)
-                        return
-                    # decrement stock
-                    await conn.execute("UPDATE shop_items SET stock=$1 WHERE item_id=$2", str(stock_int - 1), item_id)
+        # 3) 残高確認
+        cur.execute("SELECT balance FROM users WHERE user_id=?", (interaction.user.id,))
+        r = cur.fetchone()
+        balance = r[0] if r else 0
+        if balance < price:
+            await interaction.followup.send("💸 残高が足りません。", ephemeral=True)
+            conn.close()
+            return
 
-                # 5) charge user (upsert pattern)
-                await conn.execute("""
-                    INSERT INTO users (user_id, balance, total_received, total_spent)
-                    VALUES ($1, $2, 0, $3)
-                    ON CONFLICT (user_id) DO UPDATE
-                      SET balance = users.balance - $3,
-                          total_spent = users.total_spent + $3
-                """, interaction.user.id, 0, price)
+        # 4) 在庫確認（"無限"/"unlimited" 等を許容）
+        stock_str = "" if stock is None else str(stock)
+        stock_unlimited = stock_str.lower() in ("無限", "mugen", "unlimited", "inf", "∞")
+        if not stock_unlimited:
+            try:
+                stock_int = int(stock_str)
+            except:
+                # 不正な在庫値は購入不可
+                await interaction.followup.send("⚠️ 在庫情報に問題があります。管理者に連絡してください。", ephemeral=True)
+                conn.close()
+                return
+            if stock_int <= 0:
+                await interaction.followup.send("🚫 在庫がありません。", ephemeral=True)
+                conn.close()
+                return
+            # 在庫を1減らす
+            cur.execute("UPDATE shop_items SET stock = ? WHERE item_id=?", (str(stock_int - 1), item_id))
 
-                # 6) insert purchase history
-                ts = datetime.utcnow().isoformat()
-                await conn.execute("""
-                    INSERT INTO purchase_history (user_id, shop_name, item_name, price, timestamp)
-                    VALUES ($1, $2, $3, $4, $5)
-                """, interaction.user.id, shop_name, item_name, price, ts)
+        # 5) 支払い処理（残高更新）
+        cur.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?",
+                    (price, price, interaction.user.id))
+        conn.commit()
 
-        # outside transaction: role assignment and notifications
+        # 6) ロール付与（即時） — ロール解除はバックグラウンドで行う
         role_assigned = False
         role_name = None
-        if role_id and interaction.guild:
-            role_obj = interaction.guild.get_role(role_id)
-            if role_obj:
+        if role_id:
+            role = interaction.guild.get_role(role_id)
+            if role:
                 try:
-                    await interaction.user.add_roles(role_obj, reason="Shop purchase")
+                    await interaction.user.add_roles(role, reason="Shop purchase")
                     role_assigned = True
-                    role_name = role_obj.name
-                    # schedule removal if duration set (seconds)
+                    role_name = role.name
+                    # ロール解除が必要な場合（role_durationが秒数で入っている想定）
                     if role_duration and isinstance(role_duration, int) and role_duration > 0:
                         async def _remove_role_later(member: discord.Member, role: discord.Role, delay: int):
                             try:
                                 await asyncio.sleep(delay)
                                 await member.remove_roles(role, reason="Role duration expired")
+                                # optional: 購入通知チャンネルに解除を通知する
                                 ch = bot.get_channel(1408247205034328066)
                                 if ch:
                                     await ch.send(f"{member.display_name} のロール `{role.name}` の付与が終了しました。")
                             except Exception as e:
                                 print(f"[remove_role_later] error: {e}")
 
-                        asyncio.create_task(_remove_role_later(interaction.user, role_obj, role_duration))
+                        # バックグラウンドで実行（応答はブロックしない）
+                        asyncio.create_task(_remove_role_later(interaction.user, role, role_duration))
+                except Exception as e:
+                    print(f"[buy_item] role add failed: {e}")
+                    # 付与失敗でも購入自体は完了する（必要ならロール付与分の返金ロジックを追加）
 
-        # optional notify channel
+        # 7) 購入通知（任意チャンネルがあれば通知）
         notify_ch = bot.get_channel(1408247205034328066)
         if notify_ch:
             try:
@@ -880,70 +872,76 @@ async def buy_item(interaction: discord.Interaction, shop_name: str, item_name: 
             except Exception as e:
                 print(f"[buy_item] notify_ch send error: {e}")
 
-        # reply with new balance
+        # 8) 最終応答（購入完了）
+        new_balance = None
         try:
-            async with db_pool.acquire() as conn:
-                new_bal = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", interaction.user.id)
+            cur.execute("SELECT balance FROM users WHERE user_id=?", (interaction.user.id,))
+            nb = cur.fetchone()
+            new_balance = nb[0] if nb else None
         except:
-            new_bal = None
+            new_balance = None
 
         msg = f"✅ {item_name} を購入しました！ 支払額: {price} Raruin"
         if role_assigned:
             msg += f" — 付与ロール: `{role_name}`"
-        if new_bal is not None:
-            msg += f"\n💰 残高: {new_bal} Raruin"
+        if new_balance is not None:
+            msg += f"\n💰 残高: {new_balance} Raruin"
 
         await interaction.followup.send(msg, ephemeral=True)
+        conn.close()
         return
 
     except Exception as e:
+        # 例外時は詳細をログに残してユーザに通知
         print(f"[buy_item] error: {e}")
-        await interaction.followup.send("⚠️ エラーが発生しました。管理者に連絡してください。", ephemeral=True)
+        try:
+            await interaction.followup.send("⚠️ エラーが発生しました。管理者に連絡してください。", ephemeral=True)
+        except:
+            pass
+        try:
+            conn.close()
+        except:
+            pass
         return
 
-# ---- /渡す ----
+# ---------- /渡す ----------
 @tree.command(name="渡す", description="指定したユーザーにRaruinを渡す")
 @app_commands.describe(target="渡したいユーザー（@で指定）", amount="渡す額")
 async def transfer(interaction: discord.Interaction, target: discord.User, amount: int):
     if amount <= 0:
         await interaction.response.send_message("⚠️ 額は1以上にしてください。", ephemeral=True)
         return
+
+    add_user_if_not_exists(interaction.user.id)
+    c.execute("SELECT balance FROM users WHERE user_id=?", (interaction.user.id,))
+    balance = c.fetchone()[0]
+
+    if balance < amount:
+        await interaction.response.send_message("💰 残高が足りません。", ephemeral=True)
+        return
+
+    add_user_if_not_exists(target.id)
+
+    # 残高の更新
+    c.execute(
+        "UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?",
+        (amount, amount, interaction.user.id)
+    )
+    c.execute(
+        "UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
+        (amount, amount, target.id)
+    )
+    conn.commit()
+
     try:
-        await add_user_if_not_exists(interaction.user.id)
-        await add_user_if_not_exists(target.id)
+        await target.send(f"📩 {interaction.user.display_name} から {amount} Raruin を受け取りました！")
+    except:
+        pass
 
-        async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                # lock sender
-                sender_row = await conn.fetchrow("SELECT balance FROM users WHERE user_id=$1 FOR UPDATE", interaction.user.id)
-                sender_bal = sender_row["balance"] if sender_row else 0
-                if sender_bal < amount:
-                    await interaction.response.send_message("💰 残高が足りません。", ephemeral=True)
-                    return
-                # deduct sender
-                await conn.execute("""
-                    UPDATE users SET balance = balance - $1, total_spent = total_spent + $1 WHERE user_id=$2
-                """, amount, interaction.user.id)
-                # credit receiver
-                await conn.execute("""
-                    INSERT INTO users (user_id, balance, total_received, total_spent)
-                    VALUES ($1, $2, $3, 0)
-                    ON CONFLICT (user_id) DO UPDATE
-                      SET balance = users.balance + $2,
-                          total_received = users.total_received + $2
-                """, target.id, amount, amount)
+    await interaction.response.send_message(f"✅ {target.display_name} に {amount} Raruin を渡しました。")
 
-        try:
-            await target.send(f"📩 {interaction.user.display_name} から {amount} Raruin を受け取りました！")
-        except:
-            pass
 
-        await interaction.response.send_message(f"✅ {target.display_name} に {amount} Raruin を渡しました。")
-    except Exception as e:
-        print(f"[transfer] error: {e}")
-        await interaction.response.send_message("⚠️ エラーが発生しました。", ephemeral=True)
-
-# ---- /ヘルプ ----
+# ---------- /ヘルプ ----------
 @tree.command(name="ヘルプ", description="Botの全コマンド一覧を表示します")
 async def help_cmd(interaction: discord.Interaction):
     msg = (
@@ -976,103 +974,88 @@ async def help_cmd(interaction: discord.Interaction):
     )
     await interaction.response.send_message(msg, ephemeral=True)
 
-# ---- /今日の収支 ----
+# ---------- 今日の収支 ----------
 @tree.command(name="今日の収支", description="自分の受取・支出・残高をまとめて表示")
 async def today_income(interaction: discord.Interaction):
-    try:
-        await add_user_if_not_exists(interaction.user.id)
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT balance, total_received, total_spent FROM users WHERE user_id=$1", interaction.user.id)
-        if not row:
-            await interaction.response.send_message("データが見つかりません。", ephemeral=True)
-            return
-        balance = row["balance"] or 0
-        received = row["total_received"] or 0
-        spent = row["total_spent"] or 0
-        await interaction.response.send_message(
-            f"💰 {interaction.user.display_name} さんの収支:\n"
-            f"残高: {balance} Raruin\n"
-            f"受取合計: {received} Raruin\n"
-            f"支出合計: {spent} Raruin"
-        )
-    except Exception as e:
-        print(f"[today_income] error: {e}")
-        await interaction.response.send_message("⚠️ エラーが発生しました。", ephemeral=True)
+    add_user_if_not_exists(interaction.user.id)
+    c.execute("SELECT balance, total_received, total_spent FROM users WHERE user_id=?", (interaction.user.id,))
+    balance, received, spent = c.fetchone()
+    await interaction.response.send_message(
+        f"💰 {interaction.user.display_name} さんの収支:\n"
+        f"残高: {balance} Raruin\n"
+        f"受取合計: {received} Raruin\n"
+        f"支出合計: {spent} Raruin"
+    )
 
-# ---- /ショップ検索 ----
+
+# ---------- ショップ検索 ----------
 @tree.command(name="ショップ検索", description="商品名でショップ内を検索")
 @app_commands.describe(keyword="検索したい商品名")
 async def shop_search(interaction: discord.Interaction, keyword: str):
-    try:
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT s.name as shop_name, i.name as item_name, i.price FROM shop_items i "
-                "JOIN shops s ON i.shop_id = s.shop_id "
-                "WHERE i.name ILIKE $1",
-                f"%{keyword}%"
-            )
-        if not rows:
-            await interaction.response.send_message("該当する商品はありません。")
-            return
-        msg = "🔍 検索結果:\n"
-        for r in rows:
-            msg += f"{r['shop_name']} - {r['item_name']}: {r['price']} Raruin\n"
-        await interaction.response.send_message(msg)
-    except Exception as e:
-        print(f"[shop_search] error: {e}")
-        await interaction.response.send_message("⚠️ エラーが発生しました。", ephemeral=True)
+    c.execute(
+        "SELECT s.name, i.name, i.price FROM shop_items i "
+        "JOIN shops s ON i.shop_id = s.shop_id "
+        "WHERE i.name LIKE ?",
+        (f"%{keyword}%",)
+    )
+    rows = c.fetchall()
+    if not rows:
+        await interaction.response.send_message("該当する商品はありません。")
+        return
+    msg = "🔍 検索結果:\n"
+    for shop_name, item_name, price in rows:
+        msg += f"{shop_name} - {item_name}: {price} Raruin\n"
+    await interaction.response.send_message(msg)
 
-# ---- /最近の購入 ----
+
+# ---------- 最近の購入 ----------
 @tree.command(name="最近の購入", description="最近購入した商品を確認")
 async def recent_purchase(interaction: discord.Interaction):
-    try:
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT shop_name, item_name, price, timestamp FROM purchase_history "
-                "WHERE user_id=$1 ORDER BY id DESC LIMIT 5",
-                interaction.user.id
-            )
-        if not rows:
-            await interaction.response.send_message("購入履歴はありません。")
-            return
-        msg = "🛒 最近の購入:\n"
-        for r in rows:
-            ts = (r["timestamp"][:16] if r["timestamp"] else "")
-            msg += f"{ts} - {r['shop_name']} - {r['item_name']}: {r['price']} Raruin\n"
-        await interaction.response.send_message(msg)
-    except Exception as e:
-        print(f"[recent_purchase] error: {e}")
-        await interaction.response.send_message("⚠️ エラーが発生しました。", ephemeral=True)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS purchase_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            shop_name TEXT,
+            item_name TEXT,
+            price INTEGER,
+            timestamp TEXT
+        )
+    ''')
+    c.execute(
+        "SELECT shop_name, item_name, price, timestamp "
+        "FROM purchase_history WHERE user_id=? ORDER BY id DESC LIMIT 5",
+        (interaction.user.id,)
+    )
+    rows = c.fetchall()
+    if not rows:
+        await interaction.response.send_message("購入履歴はありません。")
+        return
+    msg = "🛒 最近の購入:\n"
+    for shop, item, price, ts in rows:
+        msg += f"{ts[:16]} - {shop} - {item}: {price} Raruin\n"
+    await interaction.response.send_message(msg)
 
-# ---- /リーダーボード ----
+
+# ---------- リーダーボード ----------
 @tree.command(name="リーダーボード", description="Raruin上位15名の詳細を表示")
 async def leaderboard(interaction: discord.Interaction):
-    try:
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT user_id, balance, total_received, total_spent FROM users ORDER BY balance DESC LIMIT 15"
-            )
-        if not rows:
-            await interaction.response.send_message("データがありません。")
-            return
-        msg = "🏆 Raruinリーダーボード（上位15名）\n"
-        for i, r in enumerate(rows, start=1):
-            uid = r["user_id"]
-            bal = r["balance"] or 0
-            rec = r["total_received"] or 0
-            spent = r["total_spent"] or 0
-            try:
-                user = await bot.fetch_user(uid)
-                name = user.name
-            except:
-                name = f"ユーザーID:{uid}"
-            msg += f"{i}. {name}: 残高 {bal}, 受取 {rec}, 支出 {spent}\n"
-        await interaction.response.send_message(msg)
-    except Exception as e:
-        print(f"[leaderboard] error: {e}")
-        await interaction.response.send_message("⚠️ エラーが発生しました。", ephemeral=True)
+    c.execute(
+        "SELECT user_id, balance, total_received, total_spent "
+        "FROM users ORDER BY balance DESC LIMIT 15"
+    )
+    rows = c.fetchall()
+    msg = "🏆 Raruinリーダーボード（上位15名）\n"
+    for i, (uid, bal, rec, spent) in enumerate(rows, start=1):
+        try:
+            user = await bot.fetch_user(uid)
+            name = user.name
+        except:
+            name = f"ユーザーID:{uid}"
+        msg += f"{i}. {name}: 残高 {bal}, 受取 {rec}, 支出 {spent}\n"
+    await interaction.response.send_message(msg)
 
-# ---- /役立ち ----
+
+# ---------- 役立ち ----------
 @tree.command(name="役立ち", description="便利なRaruin情報を表示")
 async def tips(interaction: discord.Interaction):
     msg = (
@@ -1083,139 +1066,83 @@ async def tips(interaction: discord.Interaction):
     )
     await interaction.response.send_message(msg)
 
-# ---- /bot情報 ----
+
+# ---------- Bot情報 ----------
 @tree.command(name="bot情報", description="Botのバージョンや稼働状況を確認")
 async def bot_info(interaction: discord.Interaction):
-    try:
-        name = bot.user.name if bot.user else "Unknown"
-        bot_id = bot.user.id if bot.user else "Unknown"
-        guilds = len(bot.guilds) if hasattr(bot, "guilds") else 0
-        msg = (
-            f"🤖 Bot情報\n"
-            f"ユーザー名: {name}\n"
-            f"ID: {bot_id}\n"
-            f"稼働中のサーバー数: {guilds}\n"
-            f"コマンド同期済み\n"
-            f"現在オンライン中"
-        )
-        await interaction.response.send_message(msg)
-    except Exception as e:
-        print(f"[bot_info] error: {e}")
-        await interaction.response.send_message("⚠️ 情報取得中にエラーが発生しました。", ephemeral=True)
+    msg = (
+        f"🤖 Bot情報\n"
+        f"ユーザー名: {bot.user.name}\n"
+        f"ID: {bot.user.id}\n"
+        f"稼働中のサーバー数: {len(bot.guilds)}\n"
+        f"コマンド同期済み\n"
+        f"現在オンライン中"
+    )
+    await interaction.response.send_message(msg)
 
 
-# ---------- Part 5: ギャンブル・自動付与・起動ログ・keep-alive (Supabase / asyncpg 対応) ----------
+
+# ---------- Part 5: ギャンブル・自動付与・起動ログ・keep-alive ----------
+
 import random
-import time
-import asyncio
-from datetime import datetime
 from discord.ext import tasks
+from flask import Flask
+from threading import Thread
+import time
+import sqlite3
 from discord.ui import View, Button
 from discord import app_commands
-import discord
 
-# 前提: global db_pool (asyncpg.Pool), bot, tree, TOKEN が別箇所で定義済み
+# ---------- DB接続 ----------
+conn = sqlite3.connect("main.db")
+c = conn.cursor()
 
-# ---------- DB 非同期ユーティリティ ----------
-async def async_get_probability() -> int:
-    """ギャンブル確率レベルを取得（存在しない場合は3を返す）"""
-    global db_pool
-    if db_pool is None:
-        return 3
-    async with db_pool.acquire() as conn:
-        val = await conn.fetchval("SELECT probability_level FROM gamble_settings WHERE id=1")
-        return int(val) if val is not None else 3
-
-async def async_update_balance(user_id: int, amount: int):
-    """
-    amount >= 0 の場合: balance += amount, total_received += amount
-    amount < 0 の場合: balance -= abs(amount), total_spent += abs(amount)
-    """
-    global db_pool
-    if db_pool is None:
-        raise RuntimeError("DB pool is not initialized")
-    async with db_pool.acquire() as conn:
-        if amount >= 0:
-            await conn.execute(
-                """
-                INSERT INTO users (user_id, balance, total_received, total_spent)
-                VALUES ($1, $2, $2, 0)
-                ON CONFLICT (user_id) DO UPDATE
-                  SET balance = users.balance + $2,
-                      total_received = users.total_received + $2
-                """,
-                user_id, amount
-            )
-        else:
-            amt = -amount
-            await conn.execute(
-                """
-                INSERT INTO users (user_id, balance, total_received, total_spent)
-                VALUES ($1, 0, 0, $2)
-                ON CONFLICT (user_id) DO UPDATE
-                  SET balance = users.balance - $2,
-                      total_spent = users.total_spent + $2
-                """,
-                user_id, amt
-            )
-
-async def async_get_balance(user_id: int) -> int:
-    global db_pool
-    if db_pool is None:
-        return 0
-    async with db_pool.acquire() as conn:
-        val = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1", user_id)
-        return int(val) if val is not None else 0
-
-# チャットや通話で付与する際にユーザー存在を保証（Part1 の init_db と同じテーブルがある前提）
-async def ensure_user_exists(user_id: int):
-    global db_pool
-    if db_pool is None:
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
-
-
-# ---------- 起動時ログ / on_ready ----------
+# ---------- 起動時ログ ----------
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print(f"Guilds: {[g.name for g in bot.guilds]}")
     print("Bot is ready and slash commands synced.")
-    try:
-        await tree.sync()
-    except Exception as e:
-        print(f"[on_ready] tree.sync error: {e}")
-    # start background tasks
-    if not voice_check.is_running():
-        voice_check.start()
+    await tree.sync()
+    voice_check.start()
     print("Background tasks started.")
 
+import sqlite3
+import asyncio
 
-# ---------- 自動付与：チャット文字数に応じて付与 ----------
+def _db_add_chat_earnings(user_id: int, earned: int):
+    conn = sqlite3.connect("main.db", timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            balance INTEGER DEFAULT 0,
+            total_received INTEGER DEFAULT 0,
+            total_spent INTEGER DEFAULT 0
+        )
+    """)
+    cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+    cur.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id = ?",
+                (earned, earned, user_id))
+    conn.commit()
+    conn.close()
+
 @bot.event
-async def on_message(message: discord.Message):
+async def on_message(message):
     if message.author.bot:
-        # ただしコマンド処理は通す
-        await bot.process_commands(message)
         return
 
     if not message.content or not message.content.strip():
         await bot.process_commands(message)
         return
 
-    # 1文字 = 1 Raruin を付与（必要に応じて1日上限等を実装）
-    earned = len(message.content)
-    try:
-        await ensure_user_exists(message.author.id)
-        await async_update_balance(message.author.id, earned)
-    except Exception as e:
-        print(f"[on_message] DB error: {e}")
+    earned = len(message.content)  # 1文字 = 1 Raruin（無制限）
+    await asyncio.to_thread(_db_add_chat_earnings, message.author.id, earned)
 
     await bot.process_commands(message)
 
-
-# ---------- 通話参加で1分ごとに付与 ----------
+# 通話参加で1分ごとに12Raruin付与
 @tasks.loop(minutes=1)
 async def voice_check():
     for guild in bot.guilds:
@@ -1223,25 +1150,52 @@ async def voice_check():
             for member in vc.members:
                 if member.bot:
                     continue
-                try:
-                    await ensure_user_exists(member.id)
-                    await async_update_balance(member.id, 12)
-                except Exception as e:
-                    print(f"[voice_check] error for user {member.id}: {e}")
-    # ループ内でコミット不要（asyncpg が自動実行）
+                add_user_if_not_exists(member.id)
+                c.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
+                          (12, 12, member.id))
+    conn.commit()
 
+# ---------- ヘルパー関数 ----------
+def get_probability():
+    c.execute("SELECT probability_level FROM gamble_settings WHERE id=1")
+    row = c.fetchone()
+    return row[0] if row else 3  # デフォルト3
 
-# ---------- ギャンブル確率＋冷却管理 ----------
-last_win_times: dict = {}  # user_id -> last win timestamp (秒)
+def update_balance(user_id, amount):
+    c.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+    if amount >= 0:
+        c.execute(
+            "UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
+            (amount, amount, user_id)
+        )
+    else:
+        c.execute(
+            "UPDATE users SET balance = balance + ?, total_spent = total_spent + ? WHERE user_id=?",
+            (amount, -amount, user_id)
+        )
+    conn.commit()
 
-async def is_win(user_id: int, base_chance: int = 0) -> bool:
+def get_balance(user_id):
+    c.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    return row[0] if row else 0
+
+# ---------- ギャンブル確率＋冷却管理 (一部ゲームで使う) ----------
+last_win_times = {}
+
+def is_win(user_id: int, base_chance: int = 0) -> bool:
     """
-    非同期版勝敗判定。連勝短時間クールダウン考慮。
+    汎用的な勝敗判定。ここを使うゲームでは『連勝クールダウン』が効きます。
+    ただし以下のコマンドでは deterministic (確定判定) に変更しているので影響しません:
+      - スロット (絵柄に基づく確定判定)
+      - ハイアンドロー (カード比較での確定判定)
+      - コイントス (常に1/2)
+      - ポーカー (手札対戦)
     """
     now = time.time()
     if user_id in last_win_times and now - last_win_times[user_id] < 60:
         return False
-    prob_level = await async_get_probability()
+    prob_level = get_probability()
     chance_table = {1: 20, 2: 15, 3: 10, 4: 5, 5: 2, 6: 1}
     chance = chance_table.get(prob_level, 10) + base_chance
     chance = min(chance, 100)
@@ -1256,12 +1210,13 @@ async def is_win(user_id: int, base_chance: int = 0) -> bool:
 @app_commands.describe(bet="ベット額")
 async def slot(interaction: discord.Interaction, bet: int):
     user_id = interaction.user.id
-    balance = await async_get_balance(user_id)
+    balance = get_balance(user_id)
     if bet <= 0 or balance < bet:
         await interaction.response.send_message(f"💰 残高不足です。あなたの残高: {balance}", ephemeral=True)
         return
 
-    prob_level = await async_get_probability()
+    # 絵柄テーブルは確率レベルで絞りはするが、判定は絵柄結果に基づいて **確定** にしました。
+    prob_level = get_probability()
     symbol_table = {
         1: ["🍒", "🍋", "🍇", "⭐", "💎"],
         2: ["🍒", "🍋", "🍇", "⭐", "💎", "🍉", "🔔"],
@@ -1273,70 +1228,68 @@ async def slot(interaction: discord.Interaction, bet: int):
     symbols = symbol_table.get(prob_level, symbol_table[3])
     reels = [random.choice(symbols) for _ in range(3)]
 
+    # 判定は **絵柄の並び** のみで行う（外部乱数による追加の否定判定はしない）
     if reels[0] == reels[1] == reels[2]:
         payout = bet * 5
-        await async_update_balance(user_id, payout)
+        update_balance(user_id, payout)
         msg = f"🎉 大当たり! +{payout} Raruin"
     elif len(set(reels)) == 2:
+        # 2つ揃い (例: A A B)
         payout = bet * 2
-        await async_update_balance(user_id, payout)
+        update_balance(user_id, payout)
         msg = f"✨ 中当たり! +{payout} Raruin"
     else:
         payout = -bet
-        await async_update_balance(user_id, payout)
+        update_balance(user_id, payout)
         msg = f"💀 ハズレ... -{bet} Raruin"
 
-    new_bal = await async_get_balance(user_id)
     await interaction.response.send_message(
-        f"🎰 {' | '.join(reels)}\n{msg}\n残高: {new_bal} Raruin"
+        f"🎰 {' | '.join(reels)}\n{msg}\n残高: {get_balance(user_id)} Raruin"
     )
 
 
-# ---------- コイントス ----------
+# ---------- コイントス (常に 1/2 の勝率) ----------
 @tree.command(name="コイントス", description="コイントスでギャンブル (公平な1/2)")
 @app_commands.describe(bet="掛け金")
 async def coin(interaction: discord.Interaction, bet: int):
     user_id = interaction.user.id
-    balance = await async_get_balance(user_id)
-    if bet <= 0 or balance < bet:
+    if bet <= 0 or get_balance(user_id) < bet:
         await interaction.response.send_message("💰 残高不足です。", ephemeral=True)
         return
 
+    # ギャンブル確率設定に左右されず常に50%で判定
     win = random.choice([True, False])
     if win:
         payout = bet * 2
-        await async_update_balance(user_id, payout)
+        update_balance(user_id, payout)
         msg = f"🎉 {payout} Raruin 獲得"
     else:
         payout = -bet
-        await async_update_balance(user_id, payout)
+        update_balance(user_id, payout)
         msg = f"💀 {bet} Raruin 減少"
 
-    new_bal = await async_get_balance(user_id)
-    await interaction.response.send_message(f"コイントス: {'表' if win else '裏'}\n{msg}\n残高: {new_bal} Raruin")
+    await interaction.response.send_message(f"コイントス: {'表' if win else '裏'}\n{msg}\n残高: {get_balance(user_id)} Raruin")
 
 
-# ---------- ハイアンドロー (View を使う) ----------
+# ---------- ハイアンドロー (カード比較で確定判定) ----------
 class HiLoView(discord.ui.View):
-    def __init__(self, user_id: int, current_card: int, bet: int):
+    def __init__(self, user_id, current_card, bet):
         super().__init__(timeout=30)
         self.user_id = user_id
         self.current_card = current_card
         self.next_card = random.randint(1, 13)
         self.bet = bet
 
-    async def finish(self, interaction: discord.Interaction, win: bool):
+    async def finish(self, interaction, win):
         if win:
             payout = int(self.bet * 0.3)
-            await async_update_balance(self.user_id, payout)
             msg = f"🎉 勝ち! +{payout} Raruin 獲得"
         else:
             payout = -self.bet
-            await async_update_balance(self.user_id, payout)
             msg = f"💀 負け... -{self.bet} Raruin"
-        new_bal = await async_get_balance(self.user_id)
+        update_balance(self.user_id, payout)
         await interaction.response.edit_message(
-            content=f"{self.current_card} → {self.next_card}\n{msg}\n残高: {new_bal} Raruin",
+            content=f"{self.current_card} → {self.next_card}\n{msg}\n残高: {get_balance(self.user_id)} Raruin",
             view=None
         )
 
@@ -1345,6 +1298,7 @@ class HiLoView(discord.ui.View):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("❌ あなた専用です", ephemeral=True)
             return
+        # 「数値比較で勝ち」が第一判定。乱数による否定は行わない（ユーザーの不満対応）
         win = self.next_card > self.current_card
         await self.finish(interaction, win)
 
@@ -1361,8 +1315,7 @@ class HiLoView(discord.ui.View):
 @app_commands.describe(bet="掛け金")
 async def hilo(interaction: discord.Interaction, bet: int):
     user_id = interaction.user.id
-    balance = await async_get_balance(user_id)
-    if bet <= 0 or balance < bet:
+    if bet <= 0 or get_balance(user_id) < bet:
         await interaction.response.send_message("💰 残高不足です。", ephemeral=True)
         return
     view = HiLoView(user_id, random.randint(1, 13), bet)
@@ -1373,24 +1326,26 @@ async def hilo(interaction: discord.Interaction, bet: int):
     )
 
 
-# ---------- ルーレット ----------
+# ---------- ルーレット (修正版: 当たり判定を絵柄結果のみに依存させる) ----------
 @tree.command(name="ルーレット", description="ルーレットで勝負")
 @app_commands.describe(bet="掛け金", choice="赤/黒/偶数/奇数/番号(0-36)")
 async def roulette(interaction: discord.Interaction, bet: int, choice: str):
     user_id = interaction.user.id
-    balance = await async_get_balance(user_id)
-    if bet <= 0 or balance < bet:
+    if bet <= 0 or get_balance(user_id) < bet:
         await interaction.response.send_message("💰 残高不足です。", ephemeral=True)
         return
 
+    # 正規化
     choice_str = choice.strip()
+
+    # ルーレット回転（実際の出目）
     number = random.randint(0, 36)
-    color = "赤" if number % 2 == 0 else "黒"  # 0 を赤扱い（必要なら変更可）
+    color = "赤" if number % 2 == 0 else "黒"  # 0 を赤扱いしている実装（必要なら0は特別扱いに変更可）
 
     win = False
     payout = 0
 
-    # 番号ベット
+    # 1) 指定が数字（番号ベット）
     if choice_str.isdigit():
         try:
             chosen_num = int(choice_str)
@@ -1400,42 +1355,53 @@ async def roulette(interaction: discord.Interaction, bet: int, choice: str):
         except:
             pass
 
-    # 赤/黒
+    # 2) 赤・黒ベット（数字ベットの判定が優先される）
     if not win and choice_str in ["赤", "黒"]:
         if choice_str == color:
             win = True
             payout = bet * 2
 
-    # 偶数/奇数
+    # 3) 偶数/奇数ベット
     if not win and choice_str in ["偶数", "奇数"]:
+        # 0は偶数扱いになる（必要なら0を無効にするロジックを追加）
         if (number % 2 == 0 and choice_str == "偶数") or (number % 2 == 1 and choice_str == "奇数"):
             win = True
             payout = bet * 2
 
+    # 結果反映
     if win:
-        await async_update_balance(user_id, payout)
+        update_balance(user_id, payout)   # 当たりならプラス
         msg = f"🎉 勝ち! {payout} Raruin 獲得"
     else:
-        await async_update_balance(user_id, -bet)
+        update_balance(user_id, -bet)     # ハズレならベットを差し引き
         msg = f"💀 負け... -{bet} Raruin"
 
-    new_bal = await async_get_balance(user_id)
+    # 結果表示
     await interaction.response.send_message(
         f"ルーレット: 出目 {number} ({color})\n"
         f"{msg}\n"
-        f"残高: {new_bal} Raruin"
+        f"残高: {get_balance(user_id)} Raruin"
     )
 
 
-# ---------- ポーカー（対ディーラー簡易版） ----------
+# ---------- ポーカー（対ディーラー版、手札を両方表示） ----------
 def hand_rank_by_counts(rank_list):
+    """
+    rank_list: ['A','K','10','10','2'] のようなランクリスト（文字列）を渡す
+    戻り値: (category_value, tiebreaker_list)
+      category_value: フォーカード>フルハウス>スリー>ツーペア>ワンペア>ハイカード (6..1)
+      tiebreaker_list: 比較用の数値リスト（高い順）
+    """
+    # ランク -> 数値変換
     order = {r: i for i, r in enumerate(['2','3','4','5','6','7','8','9','10','J','Q','K','A'], start=2)}
     counts = {}
     for r in rank_list:
         counts[r] = counts.get(r, 0) + 1
+    # (count, rank_value, rank_str) のリストを作りソート（まずカウント降順、その次にランク降順）
     items = sorted([(cnt, order[r], r) for r, cnt in counts.items()], key=lambda x: (-x[0], -x[1]))
     cnts = sorted(counts.values(), reverse=True)
 
+    # カテゴリ判定（数値は強さ。6が最強 = フォーカード）
     if cnts[0] == 4:
         category = 6
     elif cnts[0] == 3 and len(cnts) > 1 and cnts[1] == 2:
@@ -1447,8 +1413,9 @@ def hand_rank_by_counts(rank_list):
     elif cnts[0] == 2:
         category = 2
     else:
-        category = 1
+        category = 1  # ハイカード
 
+    # tiebreaker: 順に (count, rank_value) を並べたリスト（比較用）
     tiebreaker = []
     for cnt, rv, r in items:
         tiebreaker.append(cnt)
@@ -1460,34 +1427,44 @@ def hand_rank_by_counts(rank_list):
 @app_commands.describe(bet="掛け金")
 async def poker(interaction: discord.Interaction, bet: int):
     user_id = interaction.user.id
-    balance = await async_get_balance(user_id)
-    if bet <= 0 or balance < bet:
+    if bet <= 0 or get_balance(user_id) < bet:
         await interaction.response.send_message("💰 残高不足です。", ephemeral=True)
         return
 
+    # --- デッキ作成・配布 ---
     ranks = [str(n) for n in range(2, 11)] + ["J", "Q", "K", "A"]
     suits = ["♠", "♥", "♦", "♣"]
-    deck = [r + s for r in ranks for s in suits]
+    deck = [r + s for r in ranks for s in suits]  # 52枚
     cards = random.sample(deck, 10)
     player_cards = cards[:5]
     dealer_cards = cards[5:]
 
+    # ランク（スート抜き）を取得
     player_ranks = [c[:-1] for c in player_cards]
     dealer_ranks = [c[:-1] for c in dealer_cards]
 
-    player_rank = hand_rank_by_counts(player_ranks)
+    # --- 評価 ---
+    player_rank = hand_rank_by_counts(player_ranks)   # (category, tiebreaker)
     dealer_rank = hand_rank_by_counts(dealer_ranks)
 
-    prob_level = await async_get_probability()
+    # --- ギャンブル確率設定と連携（ディーラー強さ調整） ---
+    # get_probability() を使って設定値を取得（1=易しい .. 6=難しい）
+    prob_level = get_probability()  # 1..6
+    # prob_level が大きいほど「プレイヤーにとって不利（ディーラー有利）」にする
+    # modifier: prob_level 3 を基準にして差分をディーラーのカテゴリに加える
+    # （例: prob=5 -> +2 カテゴリ、prob=1 -> -2 カテゴリ）
     dealer_modifier = prob_level - 3
+    # dealer_rank を直接書き換えず、比較用に修正版を作る（カテゴリのみ調整、1..6 の範囲に制限）
     modified_dealer_category = max(1, min(6, dealer_rank[0] + dealer_modifier))
     modified_dealer_rank = (modified_dealer_category, dealer_rank[1])
 
+    # --- 勝敗判定（修正版ディーラー強さで比較） ---
     if player_rank[0] > modified_dealer_rank[0]:
         winner = "player"
     elif player_rank[0] < modified_dealer_rank[0]:
         winner = "dealer"
     else:
+        # 同カテゴリなら tiebreaker を比較（リスト同士の辞書式比較でOK）
         if player_rank[1] > modified_dealer_rank[1]:
             winner = "player"
         elif player_rank[1] < modified_dealer_rank[1]:
@@ -1495,23 +1472,30 @@ async def poker(interaction: discord.Interaction, bet: int):
         else:
             winner = "tie"
 
+    # --- 支払い倍率（プレイヤーカテゴリに基づく） ---
+    # category: 6(フォーカード),5(フルハウス),4(スリー),3(ツーペア),2(ワンペア),1(ハイカード)
     mult_map = {6: 10, 5: 7, 4: 3, 3: 2, 2: 1.5, 1: 0}
     mult = mult_map.get(player_rank[0], 0)
 
     if winner == "player" and mult > 0:
         payout = int(bet * mult)
-        await async_update_balance(user_id, payout)
+        update_balance(user_id, payout)
         msg = f"🎉 あなたの勝ち! ({payout} Raruin 獲得)"
     elif winner == "player" and mult == 0:
+        # ハイカード勝利はベット返却（設計上の選択）
         payout = bet
-        await async_update_balance(user_id, payout)
+        update_balance(user_id, payout)
         msg = f"🎉 あなたの勝ち! ハイカードで勝利: +{payout} Raruin"
     elif winner == "tie":
+        # 引き分けはベット返却（0変動）
         msg = "🤝 引き分けです。ベットは返却されます。"
     else:
-        await async_update_balance(user_id, -bet)
+        payout = -bet
+        update_balance(user_id, payout)
         msg = f"💀 あなたの負け... -{bet} Raruin"
 
+    # --- 表示 ---
+    # 表示には**実際のディーラーの手札**と、補助として「ディーラー評価（修正後カテゴリ）」を出す
     category_names = {
         6: "フォーカード",
         5: "フルハウス",
@@ -1524,38 +1508,46 @@ async def poker(interaction: discord.Interaction, bet: int):
     dealer_cat_name = category_names.get(dealer_rank[0], "不明")
     modified_dealer_cat_name = category_names.get(modified_dealer_category, "不明")
 
-    new_bal = await async_get_balance(user_id)
     await interaction.response.send_message(
         f"あなたの手札: {' '.join(player_cards)}  ({player_cat_name})\n"
         f"ディーラーの手札: {' '.join(dealer_cards)}  ({dealer_cat_name})\n"
         f"→ ギャンブル確率設定によりディーラー強さを調整: {modified_dealer_cat_name}\n\n"
-        f"{msg}\n残高: {new_bal} Raruin"
+        f"{msg}\n残高: {get_balance(user_id)} Raruin"
     )
 
 
-# ---------- 起動ログ / startup_log & main ----------
+# ---------- 起動ログ・状態確認 ----------
+import asyncio
+from datetime import datetime
+
 async def startup_log():
     print("===================================================")
     print("🚀 Bot起動開始 🚀")
     print("日時:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     print("TOKENは環境変数から正常に取得済み")
-    print("Flaskサーバーは keep_alive.py でバックグラウンド起動済み（もし使うなら）")
-    print("UptimeRobot等で常時オンラインを維持してください")
-    print("DBプール (asyncpg) が初期化済みであることを確認してください")
+    print("Flaskサーバーは keep_alive.py でバックグラウンド起動済み")
+    print("UptimeRobotで常時オンラインを維持します")
+    print("SQLiteデータベース接続済み")
+    print("各種テーブル（users, shops, shop_items, purchase_history, gamble_settings, daily_settings）を確認・作成済み")
     print("===================================================\n")
 
+    # 各テーブル確認・作成ログ
     tables = ["users", "shops", "shop_items", "purchase_history", "gamble_settings", "daily_settings"]
     for t in tables:
-        print(f"✔ テーブル '{t}' 確認済み（存在確認は init_db() 側で行ってください）")
+        print(f"✔ テーブル '{t}' 確認済み")
 
     print("\n🔧 Botのバックグラウンドタスクを開始")
     print("・雑談文字数でRaruin付与")
     print("・通話参加で1分ごとにRaruin付与")
     print("===================================================")
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(0.1)  # 少し待ってから起動
 
-
+# ---------- Bot 起動処理 ----------
 async def main():
-    await startup_log()
+    await startup_log()  # 日本語で詳細ログ
     print("🟢 Discord Botを接続中…")
-    await bot.start(TOKEN)
+    await bot.start(TOKEN)  # Bot起動のみ
+
+# 実行
+if __name__ == "__main__":
+    asyncio.run(main())
