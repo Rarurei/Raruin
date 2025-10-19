@@ -1142,7 +1142,6 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-# 通話参加で1分ごとに12Raruin付与
 @tasks.loop(minutes=1)
 async def voice_check():
     for guild in bot.guilds:
@@ -1154,6 +1153,7 @@ async def voice_check():
                 c.execute("UPDATE users SET balance = balance + ?, total_received = total_received + ? WHERE user_id=?",
                           (12, 12, member.id))
     conn.commit()
+
 
 # ---------- ヘルパー関数 ----------
 def get_probability():
