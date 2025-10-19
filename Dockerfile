@@ -1,4 +1,4 @@
-FROM python:3.12.9-slim-bookworm
+FROM python:3.11.9-slim-bookworm
 
 WORKDIR /bot
 COPY . /bot
