@@ -7,8 +7,10 @@ from datetime import datetime
 import json
 from flask import Flask
 import threading
+from google.cloud import firestore
+from google.cloud.firestore_v1 import Transaction
 
-# ---------- 環境設定 ----------
+# === 環境設定 ===
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_ID", "").split(",")]
@@ -17,8 +19,7 @@ ITEM_USED_CHANNEL_ID = int(os.getenv("ITEM_USED_CHANNEL_ID"))
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 CURRENCY_NAME = "Raruin"
 
-# ---------- Firestore ----------
-from google.cloud import firestore
+# === Firestore ===
 db = firestore.Client()
 
 def user_doc(user_id):
@@ -55,7 +56,7 @@ def change_balance(user_id, amount, is_add=True):
 def shop_exists(shop_name):
     return shop_doc(shop_name).get().exists
 
-#####--- discord.py intents etc. ---
+# discord.py intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
@@ -64,13 +65,11 @@ intents.members = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 tree = bot.tree
 
-# async autocomplete
+# --- async autocomplete ---
 async def user_autocomplete(interaction: discord.Interaction, current: str):
-    # 1ページ最大25件
     return [
         app_commands.Choice(name=m.display_name, value=str(m.id))
-        for m in interaction.guild.members
-        if current.lower() in m.display_name.lower()
+        for m in interaction.guild.members if current.lower() in m.display_name.lower()
     ][:25]
 
 async def shop_autocomplete(interaction: discord.Interaction, current: str):
@@ -83,17 +82,16 @@ async def shop_autocomplete(interaction: discord.Interaction, current: str):
 async def myitem_key_autocomplete(interaction: discord.Interaction, current: str):
     items = []
     for doc in user_doc(interaction.user.id).collection("items").stream():
-        v = doc.to_dict()
         pname = doc.id.split(":",1)[1]
         sname = doc.id.split(":",1)[0]
         display = f"{pname}（{sname}）"
-        items.append((display, doc.id))  # (表示名, item_key)
+        items.append((display, doc.id))
     return [
         app_commands.Choice(name=disp, value=key)
         for disp, key in items if current.lower() in disp.lower()
     ][:25]
 
-# ---------- Discordコマンド群 ----------
+# --- コマンド群 ---
 @tree.command(name="付与", description=f"ユーザーに {CURRENCY_NAME} 付与（管理者）")
 @app_commands.describe(target="ユーザー", amount=f"{CURRENCY_NAME}額")
 @app_commands.autocomplete(target=user_autocomplete)
@@ -273,7 +271,6 @@ async def buy_cmd(interaction, shop_name:str, product_name:str):
         f"{product_name}購入！説明:{val.get('description','')}", ephemeral=True
     )
 
-# ---アイテム表示（所持品ページング）---
 class ItemListView(ui.View):
     def __init__(self, user_id, items, page=1):
         super().__init__(timeout=120)
@@ -331,25 +328,39 @@ async def item_transfer_cmd(interaction, target:str, item:str):
     tid = int(target)
     if tid==interaction.user.id:
         await interaction.response.send_message("不正な指定", ephemeral=True);return
-    # item : shop:product の形
     if ":" not in item:
         await interaction.response.send_message("不正なアイテム指定", ephemeral=True);return
     shop_name, product_name = item.split(":",1)
-    item_ref = user_item_doc(interaction.user.id, shop_name, product_name)
-    snap = item_ref.get()
-    now_amt = snap.get("amount",0) if snap.exists else 0
-    if now_amt < 1:
-        await interaction.response.send_message("そのアイテムを持っていません", ephemeral=True);return
-    # 自分から-1
-    if now_amt == 1:
-        item_ref.delete()
-    else:
-        item_ref.update({"amount":now_amt-1})
-    # 相手に+1
-    user_item_doc(tid, shop_name, product_name).set({
-        "amount": firestore.Increment(1),
-        "shop_name":shop_name, "product_name":product_name
-    }, merge=True)
+    from_ref = user_item_doc(interaction.user.id, shop_name, product_name)
+    to_ref = user_item_doc(tid, shop_name, product_name)
+    @firestore.transactional
+    def do_transfer(transaction):
+        from_snap = from_ref.get(transaction=transaction)
+        if not from_snap.exists:
+            return False
+        now_amt = from_snap.get("amount", 0)
+        if now_amt < 1:
+            return False
+        if now_amt == 1:
+            transaction.delete(from_ref)
+        else:
+            transaction.update(from_ref, {"amount": now_amt-1})
+        to_snap = to_ref.get(transaction=transaction)
+        if to_snap.exists:
+            transaction.update(to_ref, {"amount": to_snap.get("amount", 0)+1})
+        else:
+            transaction.set(to_ref, {
+                "amount": 1,
+                "shop_name": shop_name,
+                "product_name": product_name
+            })
+        return True
+    transaction = db.transaction()
+    ok = do_transfer(transaction)
+    if not ok:
+        await interaction.response.send_message("そのアイテムを持っていません", ephemeral=True)
+        return
+    # 通知
     user2 = interaction.guild.get_member(tid)
     nowt = datetime.now()
     try:
@@ -364,19 +375,30 @@ async def use_item_cmd(interaction, item:str):
     if ":" not in item:
         await interaction.response.send_message("不正なアイテム指定", ephemeral=True);return
     shop_name, product_name = item.split(":",1)
-    item_ref = user_item_doc(interaction.user.id, shop_name, product_name)
-    snap = item_ref.get()
-    now_amt = snap.get("amount",0) if snap.exists else 0
-    if now_amt < 1:
-        await interaction.response.send_message("そのアイテムを持っていません", ephemeral=True);return
-    if now_amt == 1:
-        item_ref.delete()
-    else:
-        item_ref.update({"amount":now_amt-1})
+    ref = user_item_doc(interaction.user.id, shop_name, product_name)
+    @firestore.transactional
+    def do_use(transaction):
+        snap = ref.get(transaction=transaction)
+        if not snap.exists:
+            return False
+        amt = snap.get("amount", 0)
+        if amt < 1:
+            return False
+        if amt == 1:
+            transaction.delete(ref)
+        else:
+            transaction.update(ref, {"amount": amt-1})
+        return True
+    transaction = db.transaction()
+    ok = do_use(transaction)
+    if not ok:
+        await interaction.response.send_message("そのアイテムを持っていません", ephemeral=True)
+        return
     msg = f"{interaction.user.display_name}が{product_name}（{shop_name}）を使用！({datetime.now().strftime('%Y/%m/%d %H:%M:%S')})"
     used_ch = bot.get_channel(ITEM_USED_CHANNEL_ID)
     if used_ch: await used_ch.send(msg)
     await interaction.response.send_message(msg, ephemeral=True)
+    # バックアップ送信
     backup_ch = bot.get_channel(BACKUP_CHANNEL_ID)
     if backup_ch:
         backup = {
@@ -390,14 +412,12 @@ async def use_item_cmd(interaction, item:str):
 @bot.event
 async def on_message(message):
     if message.guild and not message.author.bot:
-        change_balance(message.author.id, len(message.content), is_add=True)  # 1文字あたり1Raruin!!
+        change_balance(message.author.id, len(message.content), is_add=True)
     await bot.process_commands(message)
 voice_times = {}
 @bot.event
 async def on_voice_state_update(member, before, after):
-    if after.channel and not before.channel:
-        voice_times[member.id] = datetime.now()
-    elif before.channel and not after.channel:
+    if after.channel and not after.channel:
         join_time = voice_times.pop(member.id, None)
         if join_time:
             minutes = max(1,int((datetime.now()-join_time).total_seconds()//60))
@@ -406,6 +426,8 @@ async def on_voice_state_update(member, before, after):
             try:
                 await member.send(f"通話報酬:{minutes}分で{reward}{CURRENCY_NAME}獲得！")
             except: pass
+    if after.channel and not before.channel:
+        voice_times[member.id] = datetime.now()
 
 @bot.event
 async def on_ready():
@@ -416,7 +438,7 @@ async def on_ready():
     except Exception as e:
         print(f"コマンド同期エラー: {e}")
 
-# ---------- Flask keep-alive ----------
+# ---- Flask keep-alive ----
 app = Flask('')
 
 @app.route('/')
