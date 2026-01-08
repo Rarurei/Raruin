@@ -101,16 +101,19 @@ async def add_raurin(interaction: discord.Interaction, target: Union[discord.Mem
     if amount <= 0:
         await interaction.response.send_message("金額が不正です", ephemeral=True); return
 
+    # 処理が長引く可能性があるので「考え中」にする
+    await interaction.response.defer(ephemeral=True)
+
     if isinstance(target, discord.Role):
         for member in target.members:
             if not member.bot:
                 change_balance(member.id, amount, is_add=True)
-        await interaction.response.send_message(f"ロール「{target.name}」の全員に {amount}{CURRENCY_NAME} を付与しました。", ephemeral=True)
+        await interaction.followup.send(f"ロール「{target.name}」の全員に {amount}{CURRENCY_NAME} を付与しました。")
     else:
         change_balance(target.id, amount, is_add=True)
         try: await target.send(f"あなたに {amount}{CURRENCY_NAME} が付与されました。")
         except: pass
-        await interaction.response.send_message(f"{target.display_name} に {amount}{CURRENCY_NAME} 付与しました。", ephemeral=True)
+        await interaction.followup.send(f"{target.display_name} に {amount}{CURRENCY_NAME} 付与しました。")
 
 @tree.command(name="減額", description=f"ユーザーまたはロールから {CURRENCY_NAME} 減額")
 @app_commands.describe(target="対象（ユーザーまたはロール）", amount=f"{CURRENCY_NAME}額")
@@ -120,14 +123,16 @@ async def remove_raurin(interaction: discord.Interaction, target: Union[discord.
     if amount <= 0:
         await interaction.response.send_message("金額が不正です", ephemeral=True); return
 
+    await interaction.response.defer(ephemeral=True)
+
     if isinstance(target, discord.Role):
         for member in target.members:
             if not member.bot:
                 change_balance(member.id, amount, is_add=False)
-        await interaction.response.send_message(f"ロール「{target.name}」の全員から {amount}{CURRENCY_NAME} を減額しました。", ephemeral=True)
+        await interaction.followup.send(f"ロール「{target.name}」の全員から {amount}{CURRENCY_NAME} を減額しました。")
     else:
         change_balance(target.id, amount, is_add=False)
-        await interaction.response.send_message(f"{target.display_name} から {amount}{CURRENCY_NAME} 減額しました。", ephemeral=True)
+        await interaction.followup.send(f"{target.display_name} から {amount}{CURRENCY_NAME} 減額しました。")
 
 @tree.command(name="shop", description="ショップ追加/削除（管理者）")
 @app_commands.describe(action="追加or削除", shop_name="ショップ名")
@@ -332,22 +337,33 @@ async def item_list_cmd(interaction, page:int=1):
 async def item_transfer_cmd(interaction: discord.Interaction, target: discord.Member, item: str):
     if target.id == interaction.user.id or ":" not in item:
         await interaction.response.send_message("不正な指定です", ephemeral=True); return
+    
     shop_name, product_name = item.split(":", 1)
     from_ref = user_item_doc(interaction.user.id, shop_name, product_name)
     to_ref = user_item_doc(target.id, shop_name, product_name)
 
     @firestore.transactional
     def do_transfer(transaction):
+        # 1. まず必要なデータをすべて読み込む（Read）
         from_snap = from_ref.get(transaction=transaction)
+        to_snap = to_ref.get(transaction=transaction)
+        
         if not from_snap.exists: return False
-        data = from_snap.to_dict() # ここを修正
+        
+        data = from_snap.to_dict()
         now_amt = data.get("amount", 0)
         if now_amt < 1: return False
-        if now_amt == 1: transaction.delete(from_ref)
-        else: transaction.update(from_ref, {"amount": now_amt - 1})
-        to_snap = to_ref.get(transaction=transaction)
-        if to_snap.exists: transaction.update(to_ref, {"amount": to_snap.to_dict().get("amount", 0) + 1})
-        else: transaction.set(to_ref, {"amount": 1, "shop_name": shop_name, "product_name": product_name})
+
+        # 2. すべて読み込み終わってから書き込む（Write）
+        if now_amt == 1:
+            transaction.delete(from_ref)
+        else:
+            transaction.update(from_ref, {"amount": now_amt - 1})
+        
+        if to_snap.exists:
+            transaction.update(to_ref, {"amount": to_snap.to_dict().get("amount", 0) + 1})
+        else:
+            transaction.set(to_ref, {"amount": 1, "shop_name": shop_name, "product_name": product_name})
         return True
 
     if do_transfer(db.transaction()):
@@ -368,18 +384,22 @@ async def use_item_cmd(interaction: discord.Interaction, item: str):
     def do_use(transaction):
         snap = ref.get(transaction=transaction)
         if not snap.exists: return False
-        data = snap.to_dict() # ここを修正
+        data = snap.to_dict()
         amt = data.get("amount", 0)
         if amt < 1: return False
-        if amt == 1: transaction.delete(ref)
-        else: transaction.update(ref, {"amount": amt - 1})
+        
+        if amt == 1:
+            transaction.delete(ref)
+        else:
+            transaction.update(ref, {"amount": amt - 1})
         return True
 
     if do_use(db.transaction()):
-        msg = f"{interaction.user.display_name}が{product_name}（{shop_name}）を使用しました！"
+        # メンション形式 <@ユーザーID> に修正
+        msg = f"<@{interaction.user.id}> が {product_name}（{shop_name}）を使用しました！"
         used_ch = bot.get_channel(ITEM_USED_CHANNEL_ID)
         if used_ch: await used_ch.send(msg)
-        await interaction.response.send_message(msg, ephemeral=True)
+        await interaction.response.send_message(f"{product_name} を使用しました。", ephemeral=True)
     else:
         await interaction.response.send_message("アイテムを持っていません", ephemeral=True)
     # バックアップ送信
