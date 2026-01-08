@@ -92,6 +92,26 @@ async def myitem_key_autocomplete(interaction: discord.Interaction, current: str
         for disp, key in items if current.lower() in disp.lower()
     ][:25]
 
+async def product_autocomplete(interaction: discord.Interaction, current: str):
+    # すでにショップ名が入力されているか確認
+    shop_name = interaction.namespace.shop_name
+    if not shop_name or not shop_exists(shop_name):
+        return []
+
+    # そのショップの商品一覧を取得
+    prods = []
+    for doc in shop_doc(shop_name).collection("products").stream():
+        p_data = doc.to_dict()
+        p_name = doc.id
+        price = p_data.get("price", 0)
+        # 候補に「商品名 (価格 Raruin)」と表示
+        display_name = f"{p_name} ({price} {CURRENCY_NAME})"
+        
+        if current.lower() in p_name.lower():
+            prods.append(app_commands.Choice(name=display_name, value=p_name))
+    
+    return prods[:25]
+
 # --- コマンド群 ---
 @tree.command(name="付与", description=f"ユーザーまたはロールに {CURRENCY_NAME} 付与")
 @app_commands.describe(target="対象（ユーザーまたはロール）", amount=f"{CURRENCY_NAME}額")
@@ -257,30 +277,38 @@ async def shop_detail_cmd(interaction, shop_name:str, page:int=1):
 
 @tree.command(name="買う", description="商品購入")
 @app_commands.describe(shop_name="ショップ名", product_name="商品名")
-@app_commands.autocomplete(shop_name=shop_autocomplete)
-async def buy_cmd(interaction, shop_name:str, product_name:str):
-    if not shop_exists(shop_name):
-        await interaction.response.send_message("ショップがありません", ephemeral=True);return
+@app_commands.autocomplete(shop_name=shop_autocomplete, product_name=product_autocomplete)
+async def buy_cmd(interaction: discord.Interaction, shop_name: str, product_name: str):
     doc = product_doc(shop_name, product_name).get()
     if not doc.exists:
-        await interaction.response.send_message("商品がありません", ephemeral=True);return
+        await interaction.response.send_message("その商品は存在しません", ephemeral=True)
+        return
+
     val = doc.to_dict()
-    b,_,_ = get_user_balance(interaction.user.id)
-    if b < val.get("price",0):
-        await interaction.response.send_message("残高不足", ephemeral=True);return
-    st = val.get("stock",0)
-    if st!=0 and st<1:
-        await interaction.response.send_message("在庫切れ", ephemeral=True);return
-    change_balance(interaction.user.id, val.get("price",0), is_add=False)
-    if st!=0:
-        product_doc(shop_name, product_name).update({"stock":st-1})
+    price = val.get("price", 0)
+    stock = val.get("stock", 0)
+    
+    b, _, _ = get_user_balance(interaction.user.id)
+    if b < price:
+        await interaction.response.send_message(f"残高が足りません（必要: {price} {CURRENCY_NAME}）", ephemeral=True)
+        return
+    
+    if stock != 0 and stock < 1:
+        await interaction.response.send_message("在庫切れです", ephemeral=True)
+        return
+    
+    # 購入処理
+    change_balance(interaction.user.id, price, is_add=False)
+    if stock != 0:
+        product_doc(shop_name, product_name).update({"stock": stock - 1})
+    
     user_item_doc(interaction.user.id, shop_name, product_name).set({
         "amount": firestore.Increment(1),
-        "shop_name": shop_name, "product_name": product_name
+        "shop_name": shop_name,
+        "product_name": product_name
     }, merge=True)
-    await interaction.response.send_message(
-        f"{product_name}購入！説明:{val.get('description','')}", ephemeral=True
-    )
+    
+    await interaction.response.send_message(f"「{product_name}」を {price} {CURRENCY_NAME} で購入しました！", ephemeral=True)
 
 class ItemListView(ui.View):
     def __init__(self, user_id, items, page=1):
