@@ -113,6 +113,27 @@ async def product_autocomplete(interaction: discord.Interaction, current: str):
     return prods[:25]
 
 # --- コマンド群 ---
+@tree.command(name="リセット", description=f"ユーザーまたはロールの残高・統計をリセット（管理者）")
+@app_commands.describe(target="対象（ユーザーまたはロール）")
+async def reset_balance_cmd(interaction: discord.Interaction, target: Union[discord.Member, discord.Role]):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("管理者限定", ephemeral=True); return
+
+    # タイムアウト対策
+    await interaction.response.defer(ephemeral=True)
+
+    def reset_user(uid):
+        user_doc(uid).set({"balance": 1000, "earned": 0, "spent": 0}, merge=True)
+
+    if isinstance(target, discord.Role):
+        for member in target.members:
+            if not member.bot:
+                reset_user(member.id)
+        await interaction.followup.send(f"ロール「{target.name}」の全員の残高・統計をリセットしました。")
+    else:
+        reset_user(target.id)
+        await interaction.followup.send(f"{target.display_name} の残高・統計をリセットしました。")
+        
 @tree.command(name="付与", description=f"ユーザーまたはロールに {CURRENCY_NAME} 付与")
 @app_commands.describe(target="対象（ユーザーまたはロール）", amount=f"{CURRENCY_NAME}額")
 async def add_raurin(interaction: discord.Interaction, target: Union[discord.Member, discord.Role], amount: int):
@@ -204,24 +225,66 @@ async def balance_cmd(interaction):
         f"あなたの残高:\n**{b} {CURRENCY_NAME}**\n獲得:{e} 消費:{s}", ephemeral=True
     )
 
-@tree.command(name="ランキング", description=f"{CURRENCY_NAME}ランキングTop10")
-async def ranking_cmd(interaction):
-    users = [
-        {**doc.to_dict(), "user_id": int(doc.id)}
-        for doc in db.collection("users").stream()
-    ]
-    users.sort(key=lambda x: x.get('balance',0), reverse=True)
-    embed = discord.Embed(title=f"{CURRENCY_NAME}ランキング")
-    for idx, u in enumerate(users[:10]):
-        member = interaction.guild.get_member(u["user_id"])
-        n = member.display_name if member else str(u["user_id"])
-        embed.add_field(
-            name=f"{idx+1}位 {n}",
-            value=f"残高:{u.get('balance',0)} / 獲得:{u.get('earned',0)} / 消費:{u.get('spent',0)}",
-            inline=False
-        )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+class RankingPagination(discord.ui.View):
+    def __init__(self, users, guild):
+        super().__init__(timeout=60)
+        self.users = users
+        self.guild = guild
+        self.page = 0
+        self.max_page = (len(users) - 1) // 10
 
+    def create_embed(self):
+        start = self.page * 10
+        end = start + 10
+        current_users = self.users[start:end]
+        
+        embed = discord.Embed(title=f"{CURRENCY_NAME}ランキング ({self.page + 1}/{self.max_page + 1}ページ)")
+        for idx, u in enumerate(current_users):
+            member = self.guild.get_member(u["user_id"])
+            name = member.display_name if member else f"不明({u['user_id']})"
+            embed.add_field(
+                name=f"{start + idx + 1}位 {name}", 
+                value=f"残高: {u.get('balance',0)} / 累計獲得: {u.get('earned',0)}", 
+                inline=False
+            )
+        return embed
+
+    @discord.ui.button(label="前へ", style=discord.ButtonStyle.gray)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page > 0:
+            self.page -= 1
+            await interaction.response.edit_message(embed=self.create_embed(), view=self)
+        else:
+            await interaction.response.send_message("最初のページです", ephemeral=True)
+
+    @discord.ui.button(label="次へ", style=discord.ButtonStyle.gray)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page < self.max_page:
+            self.page += 1
+            await interaction.response.edit_message(embed=self.create_embed(), view=self)
+        else:
+            await interaction.response.send_message("最後のページです", ephemeral=True)
+
+@tree.command(name="ランキング", description=f"{CURRENCY_NAME}ランキング")
+async def ranking_cmd(interaction: discord.Interaction):
+    # タイムアウト対策（データ取得に時間がかかる場合があるため）
+    await interaction.response.defer(ephemeral=True)
+    
+    users = []
+    for doc in db.collection("users").stream():
+        data = doc.to_dict()
+        users.append({**data, "user_id": int(doc.id)})
+    
+    # 残高順に並び替え
+    users.sort(key=lambda x: x.get('balance', 0), reverse=True)
+    
+    if not users:
+        await interaction.followup.send("データがありません。")
+        return
+
+    view = RankingPagination(users, interaction.guild)
+    await interaction.followup.send(embed=view.create_embed(), view=view)
+    
 @tree.command(name="渡す", description=f"ユーザーに {CURRENCY_NAME} を渡す")
 @app_commands.describe(target="渡す相手", amount=f"{CURRENCY_NAME}額")
 async def transfer_cmd(interaction: discord.Interaction, target: discord.Member, amount: int):
