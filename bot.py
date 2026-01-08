@@ -9,6 +9,7 @@ from flask import Flask
 import threading
 from google.cloud import firestore
 from google.cloud.firestore_v1 import Transaction
+from typing import Union, List
 
 # === 環境設定 ===
 load_dotenv()
@@ -92,7 +93,7 @@ async def myitem_key_autocomplete(interaction: discord.Interaction, current: str
     ][:25]
 
 # --- コマンド群 ---
-@tree.command(name="付与", description=f"ユーザーまたはロールに {CURRENCY_NAME} 付与（管理者）")
+@tree.command(name="付与", description=f"ユーザーまたはロールに {CURRENCY_NAME} 付与")
 @app_commands.describe(target="対象（ユーザーまたはロール）", amount=f"{CURRENCY_NAME}額")
 async def add_raurin(interaction: discord.Interaction, target: Union[discord.Member, discord.Role], amount: int):
     if not is_admin(interaction.user):
@@ -111,7 +112,7 @@ async def add_raurin(interaction: discord.Interaction, target: Union[discord.Mem
         except: pass
         await interaction.response.send_message(f"{target.display_name} に {amount}{CURRENCY_NAME} 付与しました。", ephemeral=True)
 
-@tree.command(name="減額", description=f"ユーザーまたはロールから {CURRENCY_NAME} 減額（管理者）")
+@tree.command(name="減額", description=f"ユーザーまたはロールから {CURRENCY_NAME} 減額")
 @app_commands.describe(target="対象（ユーザーまたはロール）", amount=f"{CURRENCY_NAME}額")
 async def remove_raurin(interaction: discord.Interaction, target: Union[discord.Member, discord.Role], amount: int):
     if not is_admin(interaction.user):
@@ -329,11 +330,8 @@ async def item_list_cmd(interaction, page:int=1):
 @app_commands.describe(target="渡す相手", item="渡すアイテム")
 @app_commands.autocomplete(item=myitem_key_autocomplete)
 async def item_transfer_cmd(interaction: discord.Interaction, target: discord.Member, item: str):
-    if target.id == interaction.user.id:
-        await interaction.response.send_message("自分には渡せません", ephemeral=True); return
-    if ":" not in item:
-        await interaction.response.send_message("不正なアイテム指定です", ephemeral=True); return
-    
+    if target.id == interaction.user.id or ":" not in item:
+        await interaction.response.send_message("不正な指定です", ephemeral=True); return
     shop_name, product_name = item.split(":", 1)
     from_ref = user_item_doc(interaction.user.id, shop_name, product_name)
     to_ref = user_item_doc(target.id, shop_name, product_name)
@@ -342,38 +340,27 @@ async def item_transfer_cmd(interaction: discord.Interaction, target: discord.Me
     def do_transfer(transaction):
         from_snap = from_ref.get(transaction=transaction)
         if not from_snap.exists: return False
-        
-        data = from_snap.to_dict()
+        data = from_snap.to_dict() # ここを修正
         now_amt = data.get("amount", 0)
         if now_amt < 1: return False
-
-        if now_amt == 1:
-            transaction.delete(from_ref)
-        else:
-            transaction.update(from_ref, {"amount": now_amt - 1})
-        
+        if now_amt == 1: transaction.delete(from_ref)
+        else: transaction.update(from_ref, {"amount": now_amt - 1})
         to_snap = to_ref.get(transaction=transaction)
-        if to_snap.exists:
-            transaction.update(to_ref, {"amount": to_snap.to_dict().get("amount", 0) + 1})
-        else:
-            transaction.set(to_ref, {"amount": 1, "shop_name": shop_name, "product_name": product_name})
+        if to_snap.exists: transaction.update(to_ref, {"amount": to_snap.to_dict().get("amount", 0) + 1})
+        else: transaction.set(to_ref, {"amount": 1, "shop_name": shop_name, "product_name": product_name})
         return True
 
     if do_transfer(db.transaction()):
-        try:
-            await target.send(f"{interaction.user.display_name}から{product_name}（{shop_name}）1個受け取りました。")
-        except: pass
         await interaction.response.send_message(f"{target.display_name}に{product_name}を1個渡しました", ephemeral=True)
     else:
-        await interaction.response.send_message("そのアイテムを持っていません", ephemeral=True)
+        await interaction.response.send_message("アイテムを持っていません", ephemeral=True)
 
-@tree.command(name="アイテム使う", description="所持アイテムを使用・消費")
+@tree.command(name="アイテム使う", description="所持アイテムを使用")
 @app_commands.describe(item="使うアイテム")
 @app_commands.autocomplete(item=myitem_key_autocomplete)
 async def use_item_cmd(interaction: discord.Interaction, item: str):
     if ":" not in item:
-        await interaction.response.send_message("不正なアイテム指定です", ephemeral=True); return
-    
+        await interaction.response.send_message("不正な指定", ephemeral=True); return
     shop_name, product_name = item.split(":", 1)
     ref = user_item_doc(interaction.user.id, shop_name, product_name)
 
@@ -381,29 +368,20 @@ async def use_item_cmd(interaction: discord.Interaction, item: str):
     def do_use(transaction):
         snap = ref.get(transaction=transaction)
         if not snap.exists: return False
-        
-        data = snap.to_dict()
+        data = snap.to_dict() # ここを修正
         amt = data.get("amount", 0)
         if amt < 1: return False
-
-        if amt == 1:
-            transaction.delete(ref)
-        else:
-            transaction.update(ref, {"amount": amt - 1})
+        if amt == 1: transaction.delete(ref)
+        else: transaction.update(ref, {"amount": amt - 1})
         return True
 
     if do_use(db.transaction()):
-        msg = f"{interaction.user.display_name}が{product_name}（{shop_name}）を使用！"
+        msg = f"{interaction.user.display_name}が{product_name}（{shop_name}）を使用しました！"
         used_ch = bot.get_channel(ITEM_USED_CHANNEL_ID)
         if used_ch: await used_ch.send(msg)
         await interaction.response.send_message(msg, ephemeral=True)
-        
-        backup_ch = bot.get_channel(BACKUP_CHANNEL_ID)
-        if backup_ch:
-            backup = {"user_id": interaction.user.id, "product_name": product_name, "shop_name": shop_name, "date": datetime.now().isoformat()}
-            await backup_ch.send(f"【Log】\n```json\n{json.dumps(backup, ensure_ascii=False, indent=2)}\n```")
     else:
-        await interaction.response.send_message("そのアイテムを持っていません", ephemeral=True)
+        await interaction.response.send_message("アイテムを持っていません", ephemeral=True)
     # バックアップ送信
     backup_ch = bot.get_channel(BACKUP_CHANNEL_ID)
     if backup_ch:
