@@ -1,509 +1,538 @@
 import os
 import discord
-from discord import app_commands
+from discord import app_commands, ui
 from discord.ext import commands, tasks
-import sqlite3
-import json
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime
+import json
 
-# ---- 環境設定 ----
+# ========== 環境変数とFireStore初期化 ==========
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_ID", "").split(",")]
 BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID"))
-CURRENCY_NAME = "Raruin"   # 通貨名
+ITEM_USED_CHANNEL_ID = int(os.getenv("ITEM_USED_CHANNEL_ID"))
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+CURRENCY_NAME = "Raruin"
 
-DB_PATH = "currency.db"
+from google.cloud import firestore
+db = firestore.Client()
 
-# ---- DB初期化 ----
-con = sqlite3.connect(DB_PATH)
-cur = con.cursor()
-# ユーザー: 残高、獲得額、消費額
-cur.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    balance INTEGER DEFAULT 1000,
-    earned INTEGER DEFAULT 0,
-    spent INTEGER DEFAULT 0
-);
-""")
-# ショップ
-cur.execute("""
-CREATE TABLE IF NOT EXISTS shops (
-    shop_name TEXT PRIMARY KEY
-);
-""")
-# 商品: 商品名,ショップ名,説明,金額,在庫(0=無限),許可ロール
-cur.execute("""
-CREATE TABLE IF NOT EXISTS products (
-    product_name TEXT,
-    shop_name TEXT,
-    description TEXT,
-    price INTEGER,
-    stock INTEGER,       -- 0で無限
-    buy_role INTEGER,    -- 0で全員
-    PRIMARY KEY(product_name, shop_name)
-);
-""")
-con.commit()
+# ========== Firestoreデータモデル ==========
+def user_doc(user_id):
+    return db.collection("users").document(str(user_id))
 
-# ---- Botインスタンス ----
+def shop_doc(shop_name):
+    return db.collection("shops").document(shop_name)
+
+def product_doc(shop_name, product_name):
+    # 商品はサブコレクション（shops/{shop_name}/products/{product_name}）
+    return shop_doc(shop_name).collection("products").document(product_name)
+
+def user_item_doc(user_id, shop_name, product_name):
+    return user_doc(user_id).collection("items").document(f"{shop_name}:{product_name}")
+
+# ========== 管理者判定 ==========
+def is_admin(user):
+    return user.id in ADMIN_IDS
+
+# ========== ユーザー残高操作 ==========
+def get_user_balance(user_id):
+    doc = user_doc(user_id).get()
+    if doc.exists:
+        val = doc.to_dict()
+        return int(val.get("balance",1000)), int(val.get("earned",0)), int(val.get("spent",0))
+    else:
+        user_doc(user_id).set({"balance":1000, "earned":0, "spent":0})
+        return 1000,0,0
+
+def change_balance(user_id, amount, is_add=True):
+    doc = user_doc(user_id)
+    if is_add:
+        doc.set({
+            "balance":firestore.Increment(amount),
+            "earned":firestore.Increment(amount)
+        }, merge=True)
+    else:
+        doc.set({
+            "balance":firestore.Increment(-amount),
+            "spent":firestore.Increment(amount)
+        }, merge=True)
+
+# ========== ショップ・商品操作 ==========
+def shop_exists(shop_name):
+    return shop_doc(shop_name).get().exists
+
+def get_shop_list():
+    return [d.id for d in db.collection("shops").list_documents()]
+
+def get_product_list(shop_name=None):
+    if shop_name and shop_exists(shop_name):
+        return [
+            doc.to_dict() | {"product_name":doc.id}
+            for doc in shop_doc(shop_name).collection("products").list_documents()
+        ]
+    else:
+        # すべて
+        prods = []
+        for s in get_shop_list():
+            prods.extend([
+                doc.to_dict() | {"product_name":doc.id,"shop_name":s}
+                for doc in shop_doc(s).collection("products").list_documents()
+            ])
+        return prods
+
+# ========== ユーザーアイテム ==========
+def get_user_items(user_id):
+    return [
+        doc.to_dict() | {"shop_name": doc.id.split(":")[0], "product_name":doc.id.split(":")[1]}
+        for doc in user_doc(user_id).collection("items").list_documents()
+    ]
+
+def add_user_item(user_id, shop_name, product_name, count):
+    doc = user_item_doc(user_id, shop_name, product_name)
+    snap = doc.get()
+    if snap.exists:
+        doc.set({"amount": firestore.Increment(count)}, merge=True)
+    else:
+        doc.set({"amount":count, "shop_name":shop_name, "product_name":product_name})
+
+def remove_user_item(user_id, shop_name, product_name, count):
+    doc = user_item_doc(user_id, shop_name, product_name)
+    snap = doc.get()
+    if snap.exists and snap.get("amount",0) >= count:
+        remain = snap.get("amount",0) - count
+        if remain > 0:
+            doc.update({"amount":remain})
+        else:
+            doc.delete()
+        return True
+    return False
+
+# ========== Discord Bot初期化 ==========
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 intents.guilds = True
 intents.members = True
-
 bot = commands.Bot(command_prefix="/", intents=intents)
 tree = bot.tree
 
-# ---- 管理者判定 ----
-def is_admin(user: discord.User):
-    return user.id in ADMIN_IDS
-
-# ---- DB操作ヘルパ ----
-def get_user_balance(user_id):
-    cur.execute("SELECT balance, earned, spent FROM users WHERE user_id=?", (user_id,))
-    data = cur.fetchone()
-    if data:
-        return data
-    else:
-        return (1000, 0, 0)
-
-def add_user_ifnot(user_id):
-    b, e, s = get_user_balance(user_id)
-    cur.execute("INSERT OR IGNORE INTO users (user_id, balance, earned, spent) VALUES (?, ?, ?, ?)", (user_id, b, e, s))
-    con.commit()
-
-def change_balance(user_id, amount, is_add=True):
-    add_user_ifnot(user_id)
-    if is_add:
-        cur.execute("UPDATE users SET balance = balance + ?, earned = earned + ? WHERE user_id=?", (amount, amount, user_id))
-    else:
-        cur.execute("UPDATE users SET balance = balance - ?, spent = spent + ? WHERE user_id=?", (amount, amount, user_id))
-    con.commit()
-
-def shop_exists(shop_name):
-    cur.execute("SELECT shop_name FROM shops WHERE shop_name=?", (shop_name,))
-    return cur.fetchone() is not None
-
-def product_exists(product_name, shop_name):
-    cur.execute("SELECT product_name FROM products WHERE product_name=? AND shop_name=?", (product_name, shop_name))
-    return cur.fetchone() is not None
-
-def get_shop_list():
-    cur.execute("SELECT shop_name FROM shops")
-    return [row[0] for row in cur.fetchall()]
-
-def get_product_list(shop_name=None, role_id=None):
-    q = "SELECT product_name, description, price, stock, buy_role FROM products"
-    args = []
-    conds = []
-    if shop_name:
-        conds.append("shop_name=?")
-        args.append(shop_name)
-    if role_id is not None:
-        conds.append("(buy_role=0 OR buy_role=?)")
-        args.append(role_id)
-    if conds:
-        q += " WHERE " + " AND ".join(conds)
-    return cur.execute(q, tuple(args)).fetchall()
-
-# ---- ��マンド: /付与 ----
-@tree.command(name="付与", description=f"ユーザー/ロールに {CURRENCY_NAME} を付与します（管理者のみ）")
-@app_commands.describe(target="付与するユーザーまたはロール", amount=f"付与する{CURRENCY_NAME}額")
-@app_commands.autocomplete(target=lambda i, c: [
-    app_commands.Choice(name=m.display_name, value=str(m.id))
+# ========== コマンド群 ==========
+@tree.command(name="付与", description=f"ユーザー/ロールに {CURRENCY_NAME} 付与（���理者）")
+@app_commands.describe(target="ユーザー", amount=f"{CURRENCY_NAME}額")
+@app_commands.autocomplete(target=lambda i,c:[
+    app_commands.Choice(name=m.display_name,value=str(m.id))
     for m in i.guild.members
-] + [
-    app_commands.Choice(name=r.name, value=f"role:{r.id}")
-    for r in i.guild.roles if not r.is_default()
 ])
-async def add_raurin(interaction: discord.Interaction, target: str, amount: int):
+async def add_raurin(interaction, target: str, amount: int):
     if not is_admin(interaction.user):
-        await interaction.response.send_message("権限がありません", ephemeral=True)
+        await interaction.response.send_message("管理者限定", ephemeral=True)
         return
-    if amount <= 0:
-        await interaction.response.send_message("付与額は1以上にしてください", ephemeral=True)
+    mem = interaction.guild.get_member(int(target))
+    if not mem or amount <= 0:
+        await interaction.response.send_message("不正な指定", ephemeral=True)
         return
-    # ユーザー or ロール判定
-    if target.startswith("role:"):
-        role_id = int(target.split(":",1)[1])
-        role = discord.utils.get(interaction.guild.roles, id=role_id)
-        targets = [m for m in interaction.guild.members if role in m.roles]
-    else:
-        uid = int(target)
-        member = interaction.guild.get_member(uid)
-        if not member:
-            await interaction.response.send_message("ユーザーが見つかりません", ephemeral=True)
-            return
-        targets = [member]
-    for mem in targets:
-        change_balance(mem.id, amount, is_add=True)
-        # DM通知
-        try:
-            await mem.send(f"あなたに{amount} {CURRENCY_NAME}が付与されました。（管理者操作）")
-        except Exception:
-            pass
-    await interaction.response.send_message(
-        f"{', '.join(m.display_name for m in targets)}に{amount} {CURRENCY_NAME}を付与しました",
-        ephemeral=True
-    )
+    change_balance(mem.id, amount, is_add=True)
+    try: await mem.send(f"あなたに{amount}{CURRENCY_NAME}が付与されました。")
+    except: pass
+    await interaction.response.send_message(f"{mem.display_name}に{amount}{CURRENCY_NAME}付与", ephemeral=True)
 
-# ---- コマンド: /減額 ----
-@tree.command(name="減額", description=f"ユーザー/ロールから{CURRENCY_NAME}を減額します（管理者のみ）")
-@app_commands.describe(target="減額するユーザーまたはロール", amount=f"減額する{CURRENCY_NAME}額")
-@app_commands.autocomplete(target=lambda i, c: [
-    app_commands.Choice(name=m.display_name, value=str(m.id))
+@tree.command(name="減額", description=f"ユーザー/ロールから{CURRENCY_NAME}減額（管理者）")
+@app_commands.describe(target="ユーザー", amount=f"{CURRENCY_NAME}額")
+@app_commands.autocomplete(target=lambda i,c:[
+    app_commands.Choice(name=m.display_name,value=str(m.id))
     for m in i.guild.members
-] + [
-    app_commands.Choice(name=r.name, value=f"role:{r.id}")
-    for r in i.guild.roles if not r.is_default()
 ])
-async def remove_raurin(interaction: discord.Interaction, target: str, amount: int):
+async def remove_raurin(interaction, target:str, amount:int):
     if not is_admin(interaction.user):
-        await interaction.response.send_message("権限がありません", ephemeral=True)
+        await interaction.response.send_message("管理者限定", ephemeral=True)
         return
-    if amount <= 0:
-        await interaction.response.send_message("減額は1以上を指定してください", ephemeral=True)
+    mem = interaction.guild.get_member(int(target))
+    if not mem or amount <= 0:
+        await interaction.response.send_message("不正な指定", ephemeral=True)
         return
-    # ユーザー or ロール判定
-    if target.startswith("role:"):
-        role_id = int(target.split(":",1)[1])
-        role = discord.utils.get(interaction.guild.roles, id=role_id)
-        targets = [m for m in interaction.guild.members if role in m.roles]
-    else:
-        uid = int(target)
-        member = interaction.guild.get_member(uid)
-        if not member:
-            await interaction.response.send_message("ユーザーが見つかりません", ephemeral=True)
-            return
-        targets = [member]
-    for mem in targets:
-        b,_,_ = get_user_balance(mem.id)
-        if b < amount:
-            continue
-        change_balance(mem.id, amount, is_add=False)
-        # DM通知
-        try:
-            await mem.send(f"{amount}{CURRENCY_NAME}が管��者操作で減額されました。")
-        except Exception:
-            pass
-    await interaction.response.send_message(
-        f"{', '.join(m.display_name for m in targets)}から{amount}{CURRENCY_NAME}減額しました（残高不足はスキップ）",
-        ephemeral=True
-    )
+    b,_,_ = get_user_balance(mem.id)
+    if b < amount:
+        await interaction.response.send_message("残高不足", ephemeral=True)
+        return
+    change_balance(mem.id, amount, is_add=False)
+    try: await mem.send(f"{amount}{CURRENCY_NAME}が管理者操作で減額されました。")
+    except: pass
+    await interaction.response.send_message(f"{mem.display_name}から{amount}{CURRENCY_NAME}減額", ephemeral=True)
 
-# ---- コマンド: /Shop ----
-@tree.command(name="Shop", description="ショップ追加/削除（管理者のみ）")
-@app_commands.describe(action="追加 or 削除", shop_name="ショップ名")
+@tree.command(name="Shop", description="ショップ追加/削除（管理者）")
+@app_commands.describe(action="追加or削除", shop_name="ショップ名")
 @app_commands.choices(action=[
     app_commands.Choice(name="追加", value="add"),
     app_commands.Choice(name="削除", value="remove")
 ])
-async def shop_command(interaction: discord.Interaction, action: str, shop_name: str):
+async def shop_command(interaction, action:str, shop_name:str):
     if not is_admin(interaction.user):
-        await interaction.response.send_message("権限がありません", ephemeral=True)
+        await interaction.response.send_message("管理者限定", ephemeral=True)
         return
-    if action == "add":
-        cur.execute("INSERT OR IGNORE INTO shops (shop_name) VALUES (?)", (shop_name,))
-        con.commit()
-        await interaction.response.send_message(f"ショップ「{shop_name}」を追加しました", ephemeral=True)
-    elif action == "remove":
-        cur.execute("DELETE FROM shops WHERE shop_name=?", (shop_name,))
-        cur.execute("DELETE FROM products WHERE shop_name=?", (shop_name,))
-        con.commit()
-        await interaction.response.send_message(f"ショップ「{shop_name}」と関連商品を削除しました", ephemeral=True)
+    if action=="add":
+        shop_doc(shop_name).set({})
+        await interaction.response.send_message(f"ショップ「{shop_name}」追加", ephemeral=True)
+    elif action=="remove":
+        shop_doc(shop_name).delete()
+        await interaction.response.send_message(f"ショップ「{shop_name}」削除", ephemeral=True)
 
-# ---- コマンド: /Shop商品 ----
-@tree.command(name="Shop商品", description="ショップの商品追加/削除（管理者のみ）")
+@tree.command(name="Shop商品", description="商品の追加/削除（管理者）")
 @app_commands.describe(
-    action="追加/削除",
-    product_name="商品の名前",
-    shop_name="ショップ名",
-    description="商品の説明(追加時のみ)",
-    price="金額(追加時のみ)",
-    stock="在庫数(0で無限、追加時のみ)",
-    buy_role="誰が買える(0で全員、追加時のみ/ロールID)"
+    action="追加or削除", product_name="商品名", shop_name="ショップ名",
+    description="商品の説明", price="金額", stock="在庫", buy_role="購入可能ロールID"
 )
 @app_commands.choices(action=[
     app_commands.Choice(name="追加", value="add"),
     app_commands.Choice(name="削除", value="remove")
 ])
 async def shopitem_command(
-    interaction: discord.Interaction,
-    action: str,
-    product_name: str,
-    shop_name: str,
-    description: str = "",
-    price: int = 0,
-    stock: int = 0,
-    buy_role: int = 0
+    interaction, action:str, product_name:str, shop_name:str,
+    description:str="", price:int=0, stock:int=0, buy_role:int=0
 ):
     if not is_admin(interaction.user):
-        await interaction.response.send_message("権限がありません", ephemeral=True)
+        await interaction.response.send_message("管理者限定", ephemeral=True)
         return
     if not shop_exists(shop_name):
-        await interaction.response.send_message("ショップが存在しません", ephemeral=True)
+        await interaction.response.send_message("ショップがありません", ephemeral=True)
         return
-    if action == "add":
-        if price <= 0:
-            await interaction.response.send_message("価格は1以上で指定してください", ephemeral=True)
-            return
-        cur.execute("""
-            INSERT OR REPLACE INTO products
-            (product_name, shop_name, description, price, stock, buy_role)
-            VALUES (?, ?, ?, ?, ?, ?)""",
-            (product_name, shop_name, description, price, stock, buy_role)
-        )
-        con.commit()
-        await interaction.response.send_message(f"{shop_name}に商品「{product_name}」を追加しました", ephemeral=True)
-    elif action == "remove":
-        cur.execute("DELETE FROM products WHERE product_name=? AND shop_name=?", (product_name, shop_name))
-        con.commit()
-        await interaction.response.send_message(f"{shop_name}の商品「{product_name}」を削除しました", ephemeral=True)
+    if action=="add":
+        product_doc(shop_name,product_name).set({
+            "description":description, "price":price, "stock":stock, "buy_role":buy_role
+        })
+        await interaction.response.send_message(f"{shop_name}に商品「{product_name}」追加", ephemeral=True)
+    else:
+        product_doc(shop_name,product_name).delete()
+        await interaction.response.send_message(f"{shop_name}の商品「{product_name}」削除", ephemeral=True)
 
-# ---- コマンド: /残高復元（管理者のみ） ----
-@tree.command(name="残高復元", description="バックアップチャンネルからデータ復元（最新のみ）")
+# ---残高復元（バックアップチャンネルの最新json）---
+@tree.command(name="残高復元", description="バックアップからデータリストア（管理者専用）")
 async def restore_balance(interaction: discord.Interaction):
     if not is_admin(interaction.user):
-        await interaction.response.send_message("権限がありません", ephemeral=True)
+        await interaction.response.send_message("管理者限定", ephemeral=True)
         return
     channel = bot.get_channel(BACKUP_CHANNEL_ID)
-    if not channel:
-        await interaction.response.send_message("バックアップチャンネルが見つかりません", ephemeral=True)
-        return
-    # 最新のバックアップメッセージ取得
     async for msg in channel.history(limit=10):
         if msg.content.startswith("【Raruin Backup】"):
             try:
-                start = msg.content.index("```json") + 7
-                end = msg.content.index("```", start)
-                dump = json.loads(msg.content[start:end])
-            except Exception:
-                continue
-            # 復元処理
-            cur.execute("DELETE FROM users")
-            for row in dump["users"]:
-                cur.execute("INSERT INTO users (user_id, balance, earned, spent) VALUES (?, ?, ?, ?)", tuple(row))
-            cur.execute("DELETE FROM shops")
-            for row in dump["shops"]:
-                cur.execute("INSERT INTO shops (shop_name) VALUES (?)", tuple(row))
-            cur.execute("DELETE FROM products")
-            for row in dump["products"]:
-                cur.execute("""INSERT INTO products 
-                    (product_name, shop_name, description, price, stock, buy_role)
-                    VALUES (?, ?, ?, ?, ?, ?)""", tuple(row))
-            con.commit()
+                js = msg.content[msg.content.index("```json")+7: msg.content.rindex("```")]
+                dump = json.loads(js)
+            except: continue
+            # users
+            for row in dump.get("users",[]):
+                user_doc(row['user_id']).set({
+                    "balance":row['balance'],
+                    "earned":row['earned'],
+                    "spent":row['spent']
+                })
+            # shops
+            for s in dump.get("shops",[]):
+                shop_doc(s).set({})
+            # products
+            for p in dump.get("products",[]):
+                product_doc(p['shop_name'],p['product_name']).set({
+                    "description":p.get("description",""),
+                    "price":p.get("price",0),
+                    "stock":p.get("stock",0),
+                    "buy_role":p.get("buy_role",0),
+                })
+            # user_items
+            for ui in dump.get("user_items",[]):
+                user_item_doc(ui['user_id'],ui['shop_name'],ui['product_name']).set({"amount":ui["amount"]})
             await interaction.response.send_message("復元完了！", ephemeral=True)
             return
-    await interaction.response.send_message("復元用のバックアップが見つかりません", ephemeral=True)
+    await interaction.response.send_message("バックアップメッセージが見つかりません", ephemeral=True)
 
-# ---- コマンド: /残高 ----
-@tree.command(name="残高", description=f"あなたの{CURRENCY_NAME}残高・獲得/消費を確認")
-async def balance_cmd(interaction: discord.Interaction):
-    b, e, s = get_user_balance(interaction.user.id)
+# ---残高---
+@tree.command(name="残高", description=f"{CURRENCY_NAME}残高・獲得/消費表示")
+async def balance_cmd(interaction):
+    b,e,s = get_user_balance(interaction.user.id)
     await interaction.response.send_message(
         f"あなたの残高:\n**{b} {CURRENCY_NAME}**\n獲得:{e} 消費:{s}",
         ephemeral=True
     )
 
-# ---- コマンド: /ランキング ----
-@tree.command(name="ランキング", description=f"{CURRENCY_NAME}ラン���ングTop10")
-async def ranking_cmd(interaction: discord.Interaction):
-    cur.execute("SELECT user_id, balance, earned, spent FROM users ORDER BY balance DESC LIMIT 10")
-    rows = cur.fetchall()
+# ---ランキング---
+@tree.command(name="ランキング", description=f"{CURRENCY_NAME}ランキングTop10")
+async def ranking_cmd(interaction):
+    # Firestoreは一括クエリが重いので100件でsort
+    users = [d.to_dict()|{"user_id":int(d.id)} for d in db.collection("users").list_documents()]
+    users.sort(key=lambda x: x.get('balance',0), reverse=True)
     embed = discord.Embed(title=f"{CURRENCY_NAME}ランキング")
-    for idx, (uid, b, e, s) in enumerate(rows):
-        member = interaction.guild.get_member(uid)
-        name = member.display_name if member else str(uid)
+    for idx, u in enumerate(users[:10]):
+        member = interaction.guild.get_member(u["user_id"])
+        n = member.display_name if member else str(u["user_id"])
         embed.add_field(
-            name=f"{idx+1}位 {name}",
-            value=f"残高: {b} / 獲得: {e} / 消費: {s}",
+            name=f"{idx+1}位 {n}",
+            value=f"残高:{u.get('balance',0)} / 獲得:{u.get('earned',0)} / 消費:{u.get('spent',0)}",
             inline=False
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# ---- コマンド: /渡す ----
-@tree.command(name="渡す", description=f"特定ユーザーに{CURRENCY_NAME}を渡す")
-@app_commands.describe(target="渡す相手", amount=f"渡す{CURRENCY_NAME}額")
-@app_commands.autocomplete(target=lambda i, c: [
-    app_commands.Choice(name=m.display_name, value=str(m.id))
-    for m in i.guild.members if m.id != i.user.id
+# ---渡す---
+@tree.command(name="渡す", description=f"ユーザーに{CURRENCY_NAME}を渡す")
+@app_commands.describe(target="渡す相手", amount=f"{CURRENCY_NAME}額")
+@app_commands.autocomplete(target=lambda i,c:[
+    app_commands.Choice(name=m.display_name,value=str(m.id)) for m in i.guild.members if m.id!=i.user.id
 ])
-async def transfer_cmd(interaction: discord.Interaction, target: str, amount: int):
-    target_id = int(target)
-    if target_id == interaction.user.id:
-        await interaction.response.send_message("自分へは送れません", ephemeral=True)
-        return
-    if amount <= 0:
-        await interaction.response.send_message("1以上の金額を指定してください", ephemeral=True)
+async def transfer_cmd(interaction, target:str, amount:int):
+    tid = int(target)
+    if tid == interaction.user.id or amount<=0:
+        await interaction.response.send_message("不正な指定", ephemeral=True)
         return
     b,_,_ = get_user_balance(interaction.user.id)
     if b < amount:
-        await interaction.response.send_message("残高不足です", ephemeral=True)
+        await interaction.response.send_message("残高不足", ephemeral=True)
         return
     change_balance(interaction.user.id, amount, is_add=False)
-    change_balance(target_id, amount, is_add=True)
-    user2 = interaction.guild.get_member(target_id)
+    change_balance(tid, amount, is_add=True)
+    user2 = interaction.guild.get_member(tid)
     now = datetime.now()
     try:
-        await user2.send(
-            f"{interaction.user.display_name} さんから {amount}{CURRENCY_NAME} を受け取りました\n"
-            f"日時:{now.month}月{now.day}日{now.hour}時{now.minute}分"
-        )
-    except Exception:
-        pass
-    await interaction.response.send_message(
-        f"{user2.display_name}に{amount}{CURRENCY_NAME}を渡しました", ephemeral=True
-    )
+        await user2.send(f"{interaction.user.display_name} さんから {amount}{CURRENCY_NAME} を受け取りました\n日時:{now.month}月{now.day}日{now.hour}時{now.minute}分")
+    except: pass
+    await interaction.response.send_message(f"{user2.display_name}に{amount}{CURRENCY_NAME}渡しました", ephemeral=True)
 
-# ---- コマンド: /ショップ一覧（ページング） ----
-@tree.command(name="ショップ一覧", description="現在存在するショップの一覧（10件ずつ表示）")
-@app_commands.describe(page="ページ番号(デフォルト1)")
-async def shop_list_cmd(interaction: discord.Interaction, page: int = 1):
+# ---ショップ一覧---
+@tree.command(name="ショップ一覧", description="ショップ一覧（10件/ページ）")
+@app_commands.describe(page="ページ(デフォルト1)")
+async def shop_list_cmd(interaction, page:int=1):
     shops = get_shop_list()
-    max_page = max(1, (len(shops)-1)//10+1)
+    max_page = max(1,(len(shops)-1)//10+1)
     page = max(1,min(page,max_page))
-    embed = discord.Embed(title="ショップ一覧", description=f"ページ:{page}/{max_page}")
+    embed = discord.Embed(title="ショップ一覧", description=f"{page}/{max_page}")
     start = (page-1)*10
     for s in shops[start:start+10]:
-        embed.add_field(name=s, value=f"ショップ名:{s}", inline=False)
+        embed.add_field(name=s, value=s, inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# ---- コマンド: /ショップ ----
-@tree.command(name="ショップ", description="指定ショップの商品一覧（10件ずつ表示）")
-@app_commands.describe(shop_name="ショップ名", page="ページ番号(デフォルト1)")
-@app_commands.autocomplete(shop_name=lambda i, c: [
-    app_commands.Choice(name=s, value=s)
-    for s in get_shop_list()
+# ---ショップ詳細---
+@tree.command(name="ショップ", description="指定ショップの商品一覧（ページあり）")
+@app_commands.describe(shop_name="ショップ名", page="ページ(デフォルト1)")
+@app_commands.autocomplete(shop_name=lambda i,c:[
+    app_commands.Choice(name=s,value=s) for s in get_shop_list()
 ])
-async def shop_detail_cmd(interaction: discord.Interaction, shop_name: str, page: int = 1):
+async def shop_detail_cmd(interaction, shop_name:str, page:int=1):
     if not shop_exists(shop_name):
-        await interaction.response.send_message("ショップが存在しません", ephemeral=True)
+        await interaction.response.send_message("ショップがありません", ephemeral=True)
         return
-    user_roles = [r.id for r in interaction.user.roles]
-    # 購入可能商品
-    items = []
-    for (pn, desc, price, stock, buy_role) in get_product_list(shop_name=shop_name):
-        if buy_role == 0 or buy_role in user_roles:
-            items.append((pn, desc, price, stock, buy_role))
-    max_page = max(1, (len(items)-1)//10+1)
+    prods = [
+        doc.to_dict() | {"product_name":doc.id}
+        for doc in shop_doc(shop_name).collection("products").list_documents()
+    ]
+    max_page = max(1,(len(prods)-1)//10+1)
     page = max(1,min(page,max_page))
-    embed = discord.Embed(title=f"{shop_name}の商品一覧", description=f"ページ:{page}/{max_page}")
+    embed = discord.Embed(title=f"{shop_name}商品一覧", description=f"{page}/{max_page}")
     start = (page-1)*10
-    for (pn, desc, price, stock, buy_role) in items[start:start+10]:
-        stock_str = "無限" if stock==0 else f"{stock}個"
-        role_name = "全員" if buy_role==0 else (
-            discord.utils.get(interaction.guild.roles, id=buy_role).name if discord.utils.get(interaction.guild.roles, id=buy_role) else f"ID:{buy_role}"
-        )
+    for p in prods[start:start+10]:
         embed.add_field(
-            name=pn,
-            value=f"{desc}\n価格:{price} {CURRENCY_NAME}\n在庫:{stock_str}\n購入可能:{role_name}",
-            inline=False
+            name=p["product_name"],
+            value=f'{p.get("description","")}\n価格:{p.get("price",0)}{CURRENCY_NAME}\n在庫:{p.get("stock",0) if p.get("stock",0)!=0 else "無限"}',
+            inline=False,
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# ---- コマンド: /買う ----
-@tree.command(name="買う", description="指定ショップの商品を購入します")
+# ---購入---
+@tree.command(name="買う", description="商品購入")
 @app_commands.describe(shop_name="ショップ名", product_name="商品名")
-@app_commands.autocomplete(shop_name=lambda i, c: [app_commands.Choice(name=s, value=s) for s in get_shop_list()])
-@app_commands.autocomplete(product_name=lambda i, c: [
-     app_commands.Choice(name=pn, value=pn)
-     for (pn,desc,price,stock,br) in get_product_list(shop_name=i.namespace.get("shop_name", None))
+@app_commands.autocomplete(shop_name=lambda i,c:[app_commands.Choice(name=s,value=s) for s in get_shop_list()])
+@app_commands.autocomplete(product_name=lambda i,c:[
+    app_commands.Choice(name=doc.id,value=doc.id)
+    for doc in shop_doc(i.namespace.get("shop_name","")).collection("products").list_documents()
 ])
-async def buy_cmd(interaction: discord.Interaction, shop_name: str, product_name: str):
+async def buy_cmd(interaction, shop_name:str, product_name:str):
     if not shop_exists(shop_name):
-        await interaction.response.send_message("ショップが存在しません", ephemeral=True)
+        await interaction.response.send_message("ショップがありません", ephemeral=True)
         return
-    found = cur.execute(
-        "SELECT description, price, stock, buy_role FROM products WHERE product_name=? AND shop_name=?",
-        (product_name, shop_name)
-    ).fetchone()
-    if not found:
-        await interaction.response.send_message("商品が見つかりません", ephemeral=True)
+    doc = product_doc(shop_name, product_name).get()
+    if not doc.exists:
+        await interaction.response.send_message("商品がありません", ephemeral=True)
         return
-    desc, price, stock, buy_role = found
-    user_roles = [r.id for r in interaction.user.roles]
-    if buy_role != 0 and buy_role not in user_roles:
-        await interaction.response.send_message("この商品は指定ロールのみ買えます", ephemeral=True)
-        return
+    val = doc.to_dict()
     b,_,_ = get_user_balance(interaction.user.id)
-    if b < price:
-        await interaction.response.send_message("残高不足です", ephemeral=True)
+    if b < val.get("price",0):
+        await interaction.response.send_message("残高不足", ephemeral=True)
         return
-    if stock != 0 and stock < 1:
-        await interaction.response.send_message("在庫切れです", ephemeral=True)
+    st = val.get("stock",0)
+    if st!=0 and st<1:
+        await interaction.response.send_message("在庫切れ", ephemeral=True)
         return
-    # 購入処理
-    change_balance(interaction.user.id, price, is_add=False)
-    if stock != 0:
-        cur.execute("UPDATE products SET stock = stock - 1 WHERE product_name=? AND shop_name=?", (product_name, shop_name))
-        con.commit()
+    change_balance(interaction.user.id, val.get("price",0), is_add=False)
+    if st!=0:
+        product_doc(shop_name, product_name).update({"stock":st-1})
+    add_user_item(interaction.user.id, shop_name, product_name, 1)
     await interaction.response.send_message(
-        f"{product_name}を{price}{CURRENCY_NAME}で購入しました！\n{desc}",
-        ephemeral=True
+        f"{product_name}購入！説明:{val.get('description','')}", ephemeral=True
     )
 
-# ---- チャットごとに1Raruin付与 ----
+# ---アイテム表示（所持品ページング）---
+class ItemListView(ui.View):
+    def __init__(self, user_id, items, page=1):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.items = items
+        self.page = page
+        self.max_page = max(1,(len(items)-1)//10+1)
+        if self.page > 1:
+            self.add_item(ui.Button(label="前のページ", style=discord.ButtonStyle.secondary, custom_id="prev"))
+        if self.page < self.max_page:
+            self.add_item(ui.Button(label="次のページへ", style=discord.ButtonStyle.success, custom_id="next"))
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.user_id
+    @ui.button(label="前のページ", style=discord.ButtonStyle.secondary, custom_id="prev", row=0)
+    async def prev_page(self, interaction:discord.Interaction, button:ui.Button):
+        self.page -= 1
+        await send_item_list(interaction, self.user_id, self.items, self.page)
+        self.stop()
+    @ui.button(label="次のページへ", style=discord.ButtonStyle.success, custom_id="next", row=0)
+    async def next_page(self, interaction:discord.Interaction, button:ui.Button):
+        self.page += 1
+        await send_item_list(interaction, self.user_id, self.items, self.page)
+        self.stop()
+
+async def send_item_list(interaction, user_id, items, page):
+    max_page = max(1,(len(items)-1)//10+1)
+    page = max(1,min(page,max_page))
+    embed = discord.Embed(title="所持アイテム一覧", description=f"{page}/{max_page}")
+    start = (page-1)*10
+    for itm in items[start:start+10]:
+        embed.add_field(
+            name=f"{itm['product_name']}（{itm['shop_name']}）",
+            value=f"個数: {itm.get('amount',0)}",
+            inline=False
+        )
+    view = ItemListView(user_id, items, page)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+@tree.command(name="アイテム表示", description="所持アイテム一覧（ページング）")
+@app_commands.describe(page="ページ(デフォルト1)")
+async def item_list_cmd(interaction, page:int=1):
+    items = get_user_items(interaction.user.id)
+    if not items:
+        await interaction.response.send_message("所持アイテムはありません", ephemeral=True)
+        return
+    await send_item_list(interaction, interaction.user.id, items, page)
+
+# ---アイテム渡す---
+@tree.command(name="アイテム渡す", description="所持アイテムを他人に渡す")
+@app_commands.describe(target="渡す相手", product_name="商品名", shop_name="ショップ名", amount="渡す個数")
+@app_commands.autocomplete(target=lambda i,c:[
+    app_commands.Choice(name=m.display_name,value=str(m.id)) for m in i.guild.members if m.id!=i.user.id
+])
+@app_commands.autocomplete(product_name=lambda i,c:[
+    app_commands.Choice(name=itm["product_name"],value=itm["product_name"])
+    for itm in get_user_items(i.user.id)
+])
+@app_commands.autocomplete(shop_name=lambda i,c:[
+    app_commands.Choice(name=itm["shop_name"],value=itm["shop_name"])
+    for itm in get_user_items(i.user.id)
+])
+async def item_transfer_cmd(interaction, target:str, product_name:str, shop_name:str, amount:int):
+    tid = int(target)
+    if tid==interaction.user.id or amount<=0:
+        await interaction.response.send_message("不正な指定", ephemeral=True)
+        return
+    items = get_user_items(interaction.user.id)
+    amt = next((itm["amount"] for itm in items if itm["product_name"]==product_name and itm["shop_name"]==shop_name),0)
+    if amt<amount:
+        await interaction.response.send_message("所持数不足", ephemeral=True)
+        return
+    remove_user_item(interaction.user.id, shop_name, product_name, amount)
+    add_user_item(tid, shop_name, product_name, amount)
+    user2 = interaction.guild.get_member(tid)
+    now = datetime.now()
+    try:
+        await user2.send(f"{interaction.user.display_name}から{product_name}（{shop_name}）{amount}個受け取り\n日時:{now.month}月{now.day}日{now.hour}時{now.minute}分")
+    except: pass
+    await interaction.response.send_message(f"{user2.display_name}に{product_name}（{shop_name}）{amount}個渡した", ephemeral=True)
+
+# ---アイテム使う---
+@tree.command(name="アイテム使う", description="所持アイテムを使用・消費")
+@app_commands.describe(product_name="商品名", shop_name="ショップ名")
+@app_commands.autocomplete(product_name=lambda i,c:[
+    app_commands.Choice(name=itm["product_name"], value=itm["product_name"]) for itm in get_user_items(i.user.id)
+])
+@app_commands.autocomplete(shop_name=lambda i,c:[
+    app_commands.Choice(name=itm["shop_name"], value=itm["shop_name"]) for itm in get_user_items(i.user.id)
+])
+async def use_item_cmd(interaction, product_name:str, shop_name:str):
+    items = get_user_items(interaction.user.id)
+    amt = next((itm["amount"] for itm in items if itm["product_name"]==product_name and itm["shop_name"]==shop_name),0)
+    if amt<1:
+        await interaction.response.send_message("所持していません", ephemeral=True)
+        return
+    remove_user_item(interaction.user.id, shop_name, product_name, 1)
+    msg = f"{interaction.user.display_name}が{product_name}（{shop_name}）を使用！({datetime.now().strftime('%Y/%m/%d %H:%M:%S')})"
+    used_ch = bot.get_channel(ITEM_USED_CHANNEL_ID)
+    if used_ch: await used_ch.send(msg)
+    await interaction.response.send_message(msg, ephemeral=True)
+    # バックアップにも（簡易json）
+    backup_ch = bot.get_channel(BACKUP_CHANNEL_ID)
+    if backup_ch:
+        backup = {
+            "user_id":interaction.user.id,
+            "product_name":product_name,
+            "shop_name":shop_name,
+            "date":datetime.now().isoformat()
+        }
+        await backup_ch.send(f"【Raruin Item Used Log】\n```json\n{json.dumps(backup, ensure_ascii=False, indent=2)}\n```")
+
+# ---チャット: 1Raruin付与---
 @bot.event
 async def on_message(message):
-    if not message.guild or message.author.bot: return
-    change_balance(message.author.id, 1, is_add=True)
+    if message.guild and not message.author.bot:
+        change_balance(message.author.id, 1, is_add=True)
     await bot.process_commands(message)
 
-# ---- 通話1分ごとに30Raruin ----
-voice_times = {} # {user_id: join_time}
+# ---通話: 1分ごとに30Raruin---
+voice_times = {}
 @bot.event
 async def on_voice_state_update(member, before, after):
-    # 通話参加
     if after.channel and not before.channel:
         voice_times[member.id] = datetime.now()
-    # 通話退出
     elif before.channel and not after.channel:
         join_time = voice_times.pop(member.id, None)
         if join_time:
-            minutes = max(1, int((datetime.now()-join_time).total_seconds() // 60))
+            minutes = max(1,int((datetime.now()-join_time).total_seconds()//60))
             reward = minutes * 30
             change_balance(member.id, reward, is_add=True)
             try:
-                await member.send(f"通話報酬: {minutes}分で{reward} {CURRENCY_NAME}を獲得しました！")
-            except Exception: pass
+                await member.send(f"通話報酬:{minutes}分で{reward}{CURRENCY_NAME}獲得！")
+            except: pass
 
-# ---- 毎日0時に自動バックアップ ----
+# ---毎日0時: Firestore内容をjsonバックアップ---
 @tasks.loop(hours=24)
 async def daily_backup():
     await bot.wait_until_ready()
+    users = [d.to_dict()|{"user_id":int(d.id)} for d in db.collection("users").list_documents()]
+    shops = get_shop_list()
+    products = []
+    for s in shops:
+        for prod in shop_doc(s).collection("products").list_documents():
+            products.append(prod.to_dict()|{"shop_name":s,"product_name":prod.id})
+    user_items = []
+    for u in users:
+        for itm in user_doc(u["user_id"]).collection("items").list_documents():
+            snap = itm.get()
+            if snap.exists:
+                val = snap.to_dict()
+                user_items.append({
+                    "user_id":u["user_id"], "shop_name":val.get("shop_name",""), "product_name":val.get("product_name",""), "amount":val.get("amount",0),
+                })
+    dump = {"users":users,"shops":shops,"products":products,"user_items":user_items,"date":datetime.now().isoformat()}
     channel = bot.get_channel(BACKUP_CHANNEL_ID)
-    # DBの内容取得
-    cur.execute("SELECT * FROM users")
-    users = cur.fetchall()
-    cur.execute("SELECT * FROM shops")
-    shops = cur.fetchall()
-    cur.execute("SELECT * FROM products")
-    products = cur.fetchall()
-    dump = {
-        "users": users,
-        "shops": shops,
-        "products": products,
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    await channel.send(f"【Raruin Backup】\n```json\n{json.dumps(dump, ensure_ascii=False, indent=2)}\n```")
+    if channel:
+        await channel.send(f"【Raruin Backup】\n```json\n{json.dumps(dump, ensure_ascii=False, indent=2)}\n```")
 
 @bot.event
 async def on_ready():
     print(f"Bot activated: {bot.user} ({bot.user.id})")
     try:
         synced = await tree.sync()
-        print(f"Slashコマンドを {len(synced)}個同期しました")
+        print(f"Slashコマンドを {len(synced)} 個同期")
     except Exception as e:
         print(f"コマンド同期エラー: {e}")
-    # バックアップ起動
-    now = datetime.now()
-    run_delay = ((24-now.hour)%24)*3600 - now.minute*60 - now.second
-    daily_backup.change_interval(seconds=run_delay if run_delay>0 else 60)
     daily_backup.start()
 
-# ---- main起動 ----
 bot.run(TOKEN)
