@@ -1,12 +1,11 @@
 import os
 import discord
 from discord import app_commands, ui
-from discord.ext import commands, tasks
+from discord.ext import commands
 from dotenv import load_dotenv
 from datetime import datetime
 import json
 
-# 【環境設定】
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_ID", "").split(",")]
@@ -18,24 +17,17 @@ CURRENCY_NAME = "Raruin"
 from google.cloud import firestore
 db = firestore.Client()
 
-# 【Data access functions】
-
 def user_doc(user_id):
     return db.collection("users").document(str(user_id))
-
 def shop_doc(shop_name):
     return db.collection("shops").document(shop_name)
-
 def product_doc(shop_name, product_name):
     return shop_doc(shop_name).collection("products").document(product_name)
-
 def user_item_doc(user_id, shop_name, product_name):
     return user_doc(user_id).collection("items").document(f"{shop_name}:{product_name}")
-
 def is_admin(user):
     return user.id in ADMIN_IDS
 
-# --- 残高CRUD ---
 def get_user_balance(user_id):
     doc = user_doc(user_id).get()
     if doc.exists:
@@ -44,7 +36,6 @@ def get_user_balance(user_id):
     else:
         user_doc(user_id).set({"balance":1000, "earned":0, "spent":0})
         return 1000,0,0
-
 def change_balance(user_id, amount, is_add=True):
     doc = user_doc(user_id)
     if is_add:
@@ -57,13 +48,10 @@ def change_balance(user_id, amount, is_add=True):
             "balance":firestore.Increment(-amount),
             "spent":firestore.Increment(amount)
         }, merge=True)
-
 def shop_exists(shop_name):
     return shop_doc(shop_name).get().exists
-
 def get_shop_list():
     return [d.id for d in db.collection("shops").list_documents()]
-
 def get_product_list(shop_name=None):
     if shop_name and shop_exists(shop_name):
         return [
@@ -78,13 +66,11 @@ def get_product_list(shop_name=None):
                 for doc in shop_doc(s).collection("products").list_documents()
             ])
         return prods
-
 def get_user_items(user_id):
     return [
         doc.to_dict() | {"shop_name": doc.id.split(":")[0], "product_name":doc.id.split(":")[1]}
         for doc in user_doc(user_id).collection("items").list_documents()
     ]
-
 def add_user_item(user_id, shop_name, product_name, count):
     doc = user_item_doc(user_id, shop_name, product_name)
     snap = doc.get()
@@ -92,7 +78,6 @@ def add_user_item(user_id, shop_name, product_name, count):
         doc.set({"amount": firestore.Increment(count)}, merge=True)
     else:
         doc.set({"amount":count, "shop_name":shop_name, "product_name":product_name})
-
 def remove_user_item(user_id, shop_name, product_name, count):
     doc = user_item_doc(user_id, shop_name, product_name)
     snap = doc.get()
@@ -105,7 +90,7 @@ def remove_user_item(user_id, shop_name, product_name, count):
         return True
     return False
 
-# --- Discord Bot本体 ---
+# discord.py v2.0 intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
@@ -114,37 +99,33 @@ intents.members = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 tree = bot.tree
 
-# ---- async autocomplete 関数 ----
+# async autocomplete
 async def user_autocomplete(interaction: discord.Interaction, current: str):
     return [
         app_commands.Choice(name=m.display_name, value=str(m.id))
         for m in interaction.guild.members
         if m.display_name.startswith(current)
     ][:25]
-
 async def shop_autocomplete(interaction: discord.Interaction, current: str):
     return [
         app_commands.Choice(name=s, value=s)
         for s in get_shop_list()
         if s.startswith(current)
     ][:25]
-
 async def self_product_autocomplete(interaction: discord.Interaction, current: str):
     items = get_user_items(interaction.user.id)
     return [
         app_commands.Choice(name=itm["product_name"], value=itm["product_name"])
         for itm in items if itm["product_name"].startswith(current)
     ][:25]
-
 async def self_shop_autocomplete(interaction: discord.Interaction, current: str):
     items = get_user_items(interaction.user.id)
     return [
         app_commands.Choice(name=itm["shop_name"], value=itm["shop_name"])
         for itm in items if itm["shop_name"].startswith(current)
     ][:25]
-
 async def product_autocomplete(interaction: discord.Interaction, current: str):
-    shop = interaction.namespace.get("shop_name", None)
+    shop = getattr(interaction.namespace, "shop_name", None)
     if shop:
         return [
             app_commands.Choice(name=doc.id, value=doc.id)
@@ -154,8 +135,7 @@ async def product_autocomplete(interaction: discord.Interaction, current: str):
     else:
         return []
 
-# ---- コマンド群 ----
-
+# コマンド名全部小文字！（日本語はOK）
 @tree.command(name="付与", description=f"ユーザーに {CURRENCY_NAME} 付与（管理者）")
 @app_commands.describe(target="ユーザー", amount=f"{CURRENCY_NAME}額")
 @app_commands.autocomplete(target=user_autocomplete)
@@ -187,7 +167,7 @@ async def remove_raurin(interaction, target:str, amount:int):
     except: pass
     await interaction.response.send_message(f"{mem.display_name}から{amount}{CURRENCY_NAME}減額", ephemeral=True)
 
-@tree.command(name="Shop", description="ショップ追加/削除（管理者）")
+@tree.command(name="shop", description="ショップ追加/削除（管理者）")
 @app_commands.describe(action="追加or削除", shop_name="ショップ名")
 @app_commands.choices(action=[
     app_commands.Choice(name="追加", value="add"),
@@ -203,7 +183,7 @@ async def shop_command(interaction, action:str, shop_name:str):
         shop_doc(shop_name).delete()
         await interaction.response.send_message(f"ショップ「{shop_name}」削除", ephemeral=True)
 
-@tree.command(name="Shop商品", description="商品の追加/削除（管理者）")
+@tree.command(name="shop商品", description="商品の追加/削除（管理者）")
 @app_commands.describe(
     action="追加or削除", product_name="商品名", shop_name="ショップ名",
     description="商品の説明", price="金額", stock="在庫", buy_role="購入可能ロールID"
@@ -413,7 +393,6 @@ async def use_item_cmd(interaction, product_name:str, shop_name:str):
     used_ch = bot.get_channel(ITEM_USED_CHANNEL_ID)
     if used_ch: await used_ch.send(msg)
     await interaction.response.send_message(msg, ephemeral=True)
-    # バックアップにも（簡易json）
     backup_ch = bot.get_channel(BACKUP_CHANNEL_ID)
     if backup_ch:
         backup = {
@@ -424,14 +403,11 @@ async def use_item_cmd(interaction, product_name:str, shop_name:str):
         }
         await backup_ch.send(f"【Raruin Item Used Log】\n```json\n{json.dumps(backup, ensure_ascii=False, indent=2)}\n```")
 
-# ---チャット: 1Raruin付与---
 @bot.event
 async def on_message(message):
     if message.guild and not message.author.bot:
         change_balance(message.author.id, 1, is_add=True)
     await bot.process_commands(message)
-
-# ---通話: 1分ごとに30Raruin---
 voice_times = {}
 @bot.event
 async def on_voice_state_update(member, before, after):
