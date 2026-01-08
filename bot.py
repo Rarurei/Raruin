@@ -5,7 +5,10 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from datetime import datetime
 import json
+from flask import Flask
+import threading
 
+# ---------- 環境設定 ----------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_ID", "").split(",")]
@@ -14,6 +17,7 @@ ITEM_USED_CHANNEL_ID = int(os.getenv("ITEM_USED_CHANNEL_ID"))
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 CURRENCY_NAME = "Raruin"
 
+# ---------- Firestore ----------
 from google.cloud import firestore
 db = firestore.Client()
 
@@ -27,7 +31,6 @@ def user_item_doc(user_id, shop_name, product_name):
     return user_doc(user_id).collection("items").document(f"{shop_name}:{product_name}")
 def is_admin(user):
     return user.id in ADMIN_IDS
-
 def get_user_balance(user_id):
     doc = user_doc(user_id).get()
     if doc.exists:
@@ -90,7 +93,6 @@ def remove_user_item(user_id, shop_name, product_name, count):
         return True
     return False
 
-# discord.py v2.0 intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
@@ -99,7 +101,7 @@ intents.members = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 tree = bot.tree
 
-# async autocomplete
+# ---------- async autocomplete ----------
 async def user_autocomplete(interaction: discord.Interaction, current: str):
     return [
         app_commands.Choice(name=m.display_name, value=str(m.id))
@@ -135,7 +137,7 @@ async def product_autocomplete(interaction: discord.Interaction, current: str):
     else:
         return []
 
-# コマンド名全部小文字！（日本語はOK）
+# ---------- Discordコマンド群 ----------
 @tree.command(name="付与", description=f"ユーザーに {CURRENCY_NAME} 付与（管理者）")
 @app_commands.describe(target="ユーザー", amount=f"{CURRENCY_NAME}額")
 @app_commands.autocomplete(target=user_autocomplete)
@@ -310,7 +312,6 @@ async def buy_cmd(interaction, shop_name:str, product_name:str):
         f"{product_name}購入！説明:{val.get('description','')}", ephemeral=True
     )
 
-# ---アイテム表示（所持品ページング）---
 class ItemListView(ui.View):
     def __init__(self, user_id, items, page=1):
         super().__init__(timeout=120)
@@ -432,4 +433,19 @@ async def on_ready():
     except Exception as e:
         print(f"コマンド同期エラー: {e}")
 
+# ---------- Flask keep-alive ----------
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=10000)
+
+def keep_alive():
+    t = threading.Thread(target=run)
+    t.start()
+
+keep_alive()
 bot.run(TOKEN)
