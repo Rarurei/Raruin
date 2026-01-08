@@ -568,17 +568,24 @@ async def on_voice_state_update(member, before, after):
     # --- 入室時の処理 ---
     if not before.channel and after.channel:
         voice_times[member.id] = datetime.now()
+        print(f"[DEBUG] {member.display_name} が入室しました")
 
     # --- 退出時の処理 ---
     elif before.channel and not after.channel:
         join_time = voice_times.pop(member.id, None)
         if join_time:
-            # 実際に通話した秒数を計算
-            total_seconds = (datetime.now() - join_time).total_seconds()
-            # 60秒で割って「分」を出す（小数点切り捨て）
-            minutes = int(total_seconds // 60)
+            # 退出時間を取得
+            leave_time = datetime.now()
+            # 差分（秒）を計算
+            diff = leave_time - join_time
+            seconds = diff.total_seconds()
             
-            # 1分（60秒）以上通話した場合のみ報酬を付与
+            # 分を計算（1.0を足すなどの中途半端な補正をせず、純粋に60で割る）
+            minutes = int(seconds // 60)
+            
+            # 【確認用】Botのコンソールに実際の秒数と分数を出力する
+            print(f"[DEBUG] {member.display_name}: 通話時間 {seconds:.1f}秒 -> {minutes}分と判定")
+
             if minutes >= 1:
                 reward = minutes * 60
                 change_balance(member.id, reward, is_add=True)
@@ -588,8 +595,7 @@ async def on_voice_state_update(member, before, after):
                 except:
                     pass
             else:
-                # デバッグ用ログ：1分未満の場合は何もしない
-                print(f"[Log] {member.display_name} は {int(total_seconds)}秒の滞在だったため報酬なし")
+                print(f"[DEBUG] 1分未満のため報酬なし")
                 
 @bot.event
 async def on_ready():
