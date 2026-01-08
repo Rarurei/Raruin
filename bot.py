@@ -10,6 +10,8 @@ import threading
 from google.cloud import firestore
 from google.cloud.firestore_v1 import Transaction
 from typing import Union, List
+import random
+from datetime import date
 
 # === 環境設定 ===
 load_dotenv()
@@ -493,6 +495,47 @@ async def use_item_cmd(interaction: discord.Interaction, item: str):
         await interaction.response.send_message(f"{product_name} を使用しました。", ephemeral=True)
     else:
         await interaction.response.send_message("アイテムを持っていません", ephemeral=True)
+
+@tree.command(name="ログイン", description="1日1回限定！ランダムで Raruin を獲得します")
+async def login_bonus_cmd(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    today = str(date.today())  # "2023-10-27" のような形式
+    
+    # ユーザーデータを取得
+    doc_ref = user_doc(user_id)
+    doc = doc_ref.get()
+    
+    last_login = ""
+    if doc.exists:
+        last_login = doc.to_dict().get("last_login", "")
+
+    # 日付チェック
+    if last_login == today:
+        await interaction.response.send_message(
+            "今日のログインボーナスは既に受け取っています。また明日来てくださいね！", 
+            ephemeral=True
+        )
+        return
+
+    # 1〜10000のランダムな金額を決定
+    reward = random.randint(1, 10000)
+    
+    # Firestoreの更新（残高加算 + 統計更新 + ログイン日記録）
+    doc_ref.set({
+        "balance": firestore.Increment(reward),
+        "earned": firestore.Increment(reward),
+        "last_login": today
+    }, merge=True)
+
+    # 演出用のメッセージ（高額当選時に少し変えるなど）
+    msg = f"ログインボーナス！ **{reward} {CURRENCY_NAME}** を獲得しました！"
+    if reward >= 9000:
+        msg = f"✨ **超ラッキー！** ✨\n最高級のログインボーナス！ **{reward} {CURRENCY_NAME}** を獲得しました！"
+    elif reward <= 100:
+        msg = f"ログインボーナス！ **{reward} {CURRENCY_NAME}** を獲得しました。明日はもっと当たるといいですね！"
+
+    await interaction.response.send_message(msg, ephemeral=True)
+    
     # バックアップ送信
     backup_ch = bot.get_channel(BACKUP_CHANNEL_ID)
     if backup_ch:
@@ -512,18 +555,26 @@ async def on_message(message):
 voice_times = {}
 @bot.event
 async def on_voice_state_update(member, before, after):
-    if after.channel and not after.channel:
-        join_time = voice_times.pop(member.id, None)
-        if join_time:
-            minutes = max(1,int((datetime.now()-join_time).total_seconds()//60))
-            reward = minutes * 30
-            change_balance(member.id, reward, is_add=True)
-            try:
-                await member.send(f"通話報酬:{minutes}分で{reward}{CURRENCY_NAME}獲得！")
-            except: pass
-    if after.channel and not before.channel:
+    # --- 入室時の処理 ---
+    if not before.channel and after.channel:
         voice_times[member.id] = datetime.now()
 
+    # --- 退出時の処理 ---
+    elif before.channel and not after.channel:
+        join_time = voice_times.pop(member.id, None)
+        if join_time:
+            # 経過時間を計算
+            duration = datetime.now() - join_time
+            minutes = max(1, int(duration.total_seconds() // 60))
+            
+            # 報酬計算（1分につき30 Raruin）
+            reward = minutes * 60
+            change_balance(member.id, reward, is_add=True)
+            
+            try:
+                await member.send(f"通話報酬: {minutes}分の参加で {reward} {CURRENCY_NAME} を獲得しました！")
+            except:
+                pass # DM拒否設定などの対策
 @bot.event
 async def on_ready():
     print(f"Bot activated: {bot.user} ({bot.user.id})")
