@@ -547,12 +547,22 @@ async def login_bonus_cmd(interaction: discord.Interaction):
         }
         await backup_ch.send(f"【Raruin Item Used Log】\n```json\n{json.dumps(backup, ensure_ascii=False, indent=2)}\n```")
 
+# --- メッセージ報酬の処理 ---
 @bot.event
 async def on_message(message):
+    # サーバー内での発言かつ、Bot以外のユーザーの場合
     if message.guild and not message.author.bot:
-        change_balance(message.author.id, len(message.content), is_add=True)
+        # 文字数(len)を取得して 1文字 = 1 Raruin 付与
+        msg_reward = len(message.content)
+        if msg_reward > 0:
+            change_balance(message.author.id, msg_reward, is_add=True)
+    
+    # スラッシュコマンドを正常に動作させるために必須
     await bot.process_commands(message)
+
+# --- 通話報酬の処理 ---
 voice_times = {}
+
 @bot.event
 async def on_voice_state_update(member, before, after):
     # --- 入室時の処理 ---
@@ -563,18 +573,24 @@ async def on_voice_state_update(member, before, after):
     elif before.channel and not after.channel:
         join_time = voice_times.pop(member.id, None)
         if join_time:
-            # 経過時間を計算
-            duration = datetime.now() - join_time
-            minutes = max(1, int(duration.total_seconds() // 60))
+            # 実際に通話した秒数を計算
+            total_seconds = (datetime.now() - join_time).total_seconds()
+            # 60秒で割って「分」を出す（小数点切り捨て）
+            minutes = int(total_seconds // 60)
             
-            # 報酬計算（1分につき30 Raruin）
-            reward = minutes * 60
-            change_balance(member.id, reward, is_add=True)
-            
-            try:
-                await member.send(f"通話報酬: {minutes}分の参加で {reward} {CURRENCY_NAME} を獲得しました！")
-            except:
-                pass # DM拒否設定などの対策
+            # 1分（60秒）以上通話した場合のみ報酬を付与
+            if minutes >= 1:
+                reward = minutes * 60
+                change_balance(member.id, reward, is_add=True)
+                
+                try:
+                    await member.send(f"通話報酬: {minutes}分の参加で {reward} {CURRENCY_NAME} を獲得しました！")
+                except:
+                    pass
+            else:
+                # デバッグ用ログ：1分未満の場合は何もしない
+                print(f"[Log] {member.display_name} は {int(total_seconds)}秒の滞在だったため報酬なし")
+                
 @bot.event
 async def on_ready():
     print(f"Bot activated: {bot.user} ({bot.user.id})")
