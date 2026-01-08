@@ -31,6 +31,7 @@ def user_item_doc(user_id, shop_name, product_name):
     return user_doc(user_id).collection("items").document(f"{shop_name}:{product_name}")
 def is_admin(user):
     return user.id in ADMIN_IDS
+
 def get_user_balance(user_id):
     doc = user_doc(user_id).get()
     if doc.exists:
@@ -53,46 +54,8 @@ def change_balance(user_id, amount, is_add=True):
         }, merge=True)
 def shop_exists(shop_name):
     return shop_doc(shop_name).get().exists
-def get_shop_list():
-    return [d.id for d in db.collection("shops").list_documents()]
-def get_product_list(shop_name=None):
-    if shop_name and shop_exists(shop_name):
-        return [
-            doc.to_dict() | {"product_name":doc.id}
-            for doc in shop_doc(shop_name).collection("products").list_documents()
-        ]
-    else:
-        prods = []
-        for s in get_shop_list():
-            prods.extend([
-                doc.to_dict() | {"product_name":doc.id,"shop_name":s}
-                for doc in shop_doc(s).collection("products").list_documents()
-            ])
-        return prods
-def get_user_items(user_id):
-    return [
-        doc.to_dict() | {"shop_name": doc.id.split(":")[0], "product_name":doc.id.split(":")[1]}
-        for doc in user_doc(user_id).collection("items").list_documents()
-    ]
-def add_user_item(user_id, shop_name, product_name, count):
-    doc = user_item_doc(user_id, shop_name, product_name)
-    snap = doc.get()
-    if snap.exists:
-        doc.set({"amount": firestore.Increment(count)}, merge=True)
-    else:
-        doc.set({"amount":count, "shop_name":shop_name, "product_name":product_name})
-def remove_user_item(user_id, shop_name, product_name, count):
-    doc = user_item_doc(user_id, shop_name, product_name)
-    snap = doc.get()
-    if snap.exists and snap.get("amount",0) >= count:
-        remain = snap.get("amount",0) - count
-        if remain > 0:
-            doc.update({"amount":remain})
-        else:
-            doc.delete()
-        return True
-    return False
 
+#####--- discord.py intents etc. ---
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
@@ -101,41 +64,34 @@ intents.members = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 tree = bot.tree
 
-# ---------- async autocomplete ----------
+# async autocomplete
 async def user_autocomplete(interaction: discord.Interaction, current: str):
+    # 1ページ最大25件
     return [
         app_commands.Choice(name=m.display_name, value=str(m.id))
         for m in interaction.guild.members
-        if m.display_name.startswith(current)
+        if current.lower() in m.display_name.lower()
     ][:25]
+
 async def shop_autocomplete(interaction: discord.Interaction, current: str):
+    shops = [doc.id for doc in db.collection("shops").stream()]
     return [
         app_commands.Choice(name=s, value=s)
-        for s in get_shop_list()
-        if s.startswith(current)
+        for s in shops if current.lower() in s.lower()
     ][:25]
-async def self_product_autocomplete(interaction: discord.Interaction, current: str):
-    items = get_user_items(interaction.user.id)
+
+async def myitem_key_autocomplete(interaction: discord.Interaction, current: str):
+    items = []
+    for doc in user_doc(interaction.user.id).collection("items").stream():
+        v = doc.to_dict()
+        pname = doc.id.split(":",1)[1]
+        sname = doc.id.split(":",1)[0]
+        display = f"{pname}（{sname}）"
+        items.append((display, doc.id))  # (表示名, item_key)
     return [
-        app_commands.Choice(name=itm["product_name"], value=itm["product_name"])
-        for itm in items if itm["product_name"].startswith(current)
+        app_commands.Choice(name=disp, value=key)
+        for disp, key in items if current.lower() in disp.lower()
     ][:25]
-async def self_shop_autocomplete(interaction: discord.Interaction, current: str):
-    items = get_user_items(interaction.user.id)
-    return [
-        app_commands.Choice(name=itm["shop_name"], value=itm["shop_name"])
-        for itm in items if itm["shop_name"].startswith(current)
-    ][:25]
-async def product_autocomplete(interaction: discord.Interaction, current: str):
-    shop = getattr(interaction.namespace, "shop_name", None)
-    if shop:
-        return [
-            app_commands.Choice(name=doc.id, value=doc.id)
-            for doc in shop_doc(shop).collection("products").list_documents()
-            if doc.id.startswith(current)
-        ][:25]
-    else:
-        return []
 
 # ---------- Discordコマンド群 ----------
 @tree.command(name="付与", description=f"ユーザーに {CURRENCY_NAME} 付与（管理者）")
@@ -221,7 +177,10 @@ async def balance_cmd(interaction):
 
 @tree.command(name="ランキング", description=f"{CURRENCY_NAME}ランキングTop10")
 async def ranking_cmd(interaction):
-    users = [d.to_dict()|{"user_id":int(d.id)} for d in db.collection("users").list_documents()]
+    users = [
+        {**doc.to_dict(), "user_id": int(doc.id)}
+        for doc in db.collection("users").stream()
+    ]
     users.sort(key=lambda x: x.get('balance',0), reverse=True)
     embed = discord.Embed(title=f"{CURRENCY_NAME}ランキング")
     for idx, u in enumerate(users[:10]):
@@ -256,7 +215,7 @@ async def transfer_cmd(interaction, target:str, amount:int):
 @tree.command(name="ショップ一覧", description="ショップ一覧（10件/ページ）")
 @app_commands.describe(page="ページ(デフォルト1)")
 async def shop_list_cmd(interaction, page:int=1):
-    shops = get_shop_list()
+    shops = [doc.id for doc in db.collection("shops").stream()]
     max_page = max(1,(len(shops)-1)//10+1)
     page = max(1,min(page,max_page))
     embed = discord.Embed(title="ショップ一覧", description=f"{page}/{max_page}")
@@ -273,7 +232,7 @@ async def shop_detail_cmd(interaction, shop_name:str, page:int=1):
         await interaction.response.send_message("ショップがありません", ephemeral=True);return
     prods = [
         doc.to_dict() | {"product_name":doc.id}
-        for doc in shop_doc(shop_name).collection("products").list_documents()
+        for doc in shop_doc(shop_name).collection("products").stream()
     ]
     max_page = max(1,(len(prods)-1)//10+1)
     page = max(1,min(page,max_page))
@@ -290,7 +249,6 @@ async def shop_detail_cmd(interaction, shop_name:str, page:int=1):
 @tree.command(name="買う", description="商品購入")
 @app_commands.describe(shop_name="ショップ名", product_name="商品名")
 @app_commands.autocomplete(shop_name=shop_autocomplete)
-@app_commands.autocomplete(product_name=product_autocomplete)
 async def buy_cmd(interaction, shop_name:str, product_name:str):
     if not shop_exists(shop_name):
         await interaction.response.send_message("ショップがありません", ephemeral=True);return
@@ -307,11 +265,15 @@ async def buy_cmd(interaction, shop_name:str, product_name:str):
     change_balance(interaction.user.id, val.get("price",0), is_add=False)
     if st!=0:
         product_doc(shop_name, product_name).update({"stock":st-1})
-    add_user_item(interaction.user.id, shop_name, product_name, 1)
+    user_item_doc(interaction.user.id, shop_name, product_name).set({
+        "amount": firestore.Increment(1),
+        "shop_name": shop_name, "product_name": product_name
+    }, merge=True)
     await interaction.response.send_message(
         f"{product_name}購入！説明:{val.get('description','')}", ephemeral=True
     )
 
+# ---アイテム表示（所持品ページング）---
 class ItemListView(ui.View):
     def __init__(self, user_id, items, page=1):
         super().__init__(timeout=120)
@@ -353,43 +315,64 @@ async def send_item_list(interaction, user_id, items, page):
 @tree.command(name="アイテム表示", description="所持アイテム一覧（ページング）")
 @app_commands.describe(page="ページ(デフォルト1)")
 async def item_list_cmd(interaction, page:int=1):
-    items = get_user_items(interaction.user.id)
+    items = [
+        {**doc.to_dict(), "shop_name": doc.id.split(":")[0], "product_name":doc.id.split(":")[1]}
+        for doc in user_doc(interaction.user.id).collection("items").stream()
+    ]
     if not items:
         await interaction.response.send_message("所持アイテムはありません", ephemeral=True);return
     await send_item_list(interaction, interaction.user.id, items, page)
 
 @tree.command(name="アイテム渡す", description="所持アイテムを他人に渡す")
-@app_commands.describe(target="渡す相手", product_name="商品名", shop_name="ショップ名", amount="渡す個数")
+@app_commands.describe(target="渡す相手", item="渡すアイテム")
 @app_commands.autocomplete(target=user_autocomplete)
-@app_commands.autocomplete(product_name=self_product_autocomplete)
-@app_commands.autocomplete(shop_name=self_shop_autocomplete)
-async def item_transfer_cmd(interaction, target:str, product_name:str, shop_name:str, amount:int):
+@app_commands.autocomplete(item=myitem_key_autocomplete)
+async def item_transfer_cmd(interaction, target:str, item:str):
     tid = int(target)
-    if tid==interaction.user.id or amount<=0:
+    if tid==interaction.user.id:
         await interaction.response.send_message("不正な指定", ephemeral=True);return
-    items = get_user_items(interaction.user.id)
-    amt = next((itm["amount"] for itm in items if itm["product_name"]==product_name and itm["shop_name"]==shop_name),0)
-    if amt<amount:
-        await interaction.response.send_message("所持数不足", ephemeral=True);return
-    remove_user_item(interaction.user.id, shop_name, product_name, amount)
-    add_user_item(tid, shop_name, product_name, amount)
+    # item : shop:product の形
+    if ":" not in item:
+        await interaction.response.send_message("不正なアイテム指定", ephemeral=True);return
+    shop_name, product_name = item.split(":",1)
+    item_ref = user_item_doc(interaction.user.id, shop_name, product_name)
+    snap = item_ref.get()
+    now_amt = snap.get("amount",0) if snap.exists else 0
+    if now_amt < 1:
+        await interaction.response.send_message("そのアイテムを持っていません", ephemeral=True);return
+    # 自分から-1
+    if now_amt == 1:
+        item_ref.delete()
+    else:
+        item_ref.update({"amount":now_amt-1})
+    # 相手に+1
+    user_item_doc(tid, shop_name, product_name).set({
+        "amount": firestore.Increment(1),
+        "shop_name":shop_name, "product_name":product_name
+    }, merge=True)
     user2 = interaction.guild.get_member(tid)
-    now = datetime.now()
+    nowt = datetime.now()
     try:
-        await user2.send(f"{interaction.user.display_name}から{product_name}（{shop_name}）{amount}個受け取り\n日時:{now.month}月{now.day}日{now.hour}時{now.minute}分")
+        await user2.send(f"{interaction.user.display_name}から{product_name}（{shop_name}）1個受け取り\n日時:{nowt.month}月{nowt.day}日{nowt.hour}時{nowt.minute}分")
     except: pass
-    await interaction.response.send_message(f"{user2.display_name}に{product_name}（{shop_name}）{amount}個渡した", ephemeral=True)
+    await interaction.response.send_message(f"{user2.display_name}に{product_name}（{shop_name}）1個渡した", ephemeral=True)
 
 @tree.command(name="アイテム使う", description="所持アイテムを使用・消費")
-@app_commands.describe(product_name="商品名", shop_name="ショップ名")
-@app_commands.autocomplete(product_name=self_product_autocomplete)
-@app_commands.autocomplete(shop_name=self_shop_autocomplete)
-async def use_item_cmd(interaction, product_name:str, shop_name:str):
-    items = get_user_items(interaction.user.id)
-    amt = next((itm["amount"] for itm in items if itm["product_name"]==product_name and itm["shop_name"]==shop_name),0)
-    if amt<1:
-        await interaction.response.send_message("所持していません", ephemeral=True);return
-    remove_user_item(interaction.user.id, shop_name, product_name, 1)
+@app_commands.describe(item="使うアイテム")
+@app_commands.autocomplete(item=myitem_key_autocomplete)
+async def use_item_cmd(interaction, item:str):
+    if ":" not in item:
+        await interaction.response.send_message("不正なアイテム指定", ephemeral=True);return
+    shop_name, product_name = item.split(":",1)
+    item_ref = user_item_doc(interaction.user.id, shop_name, product_name)
+    snap = item_ref.get()
+    now_amt = snap.get("amount",0) if snap.exists else 0
+    if now_amt < 1:
+        await interaction.response.send_message("そのアイテムを持っていません", ephemeral=True);return
+    if now_amt == 1:
+        item_ref.delete()
+    else:
+        item_ref.update({"amount":now_amt-1})
     msg = f"{interaction.user.display_name}が{product_name}（{shop_name}）を使用！({datetime.now().strftime('%Y/%m/%d %H:%M:%S')})"
     used_ch = bot.get_channel(ITEM_USED_CHANNEL_ID)
     if used_ch: await used_ch.send(msg)
@@ -407,7 +390,7 @@ async def use_item_cmd(interaction, product_name:str, shop_name:str):
 @bot.event
 async def on_message(message):
     if message.guild and not message.author.bot:
-        change_balance(message.author.id, 1, is_add=True)
+        change_balance(message.author.id, len(message.content), is_add=True)  # 1文字あたり1Raruin!!
     await bot.process_commands(message)
 voice_times = {}
 @bot.event
