@@ -536,7 +536,7 @@ async def login_bonus_cmd(interaction: discord.Interaction):
 
     await interaction.response.send_message(msg, ephemeral=True)
 
-    # 前提: discord.py 2.4.0 / app_commands 使用
+# 前提: discord.py 2.4.0 / app_commands 使用
 # 既存DB(main.db)に以下テーブルを追加する想定
 # lottery_settings, lottery_remaining
 
@@ -594,6 +594,25 @@ def draw_lottery(setting: dict, count: int):
 
 
 # ==============================
+# オートコンプリート共通
+# ==============================
+
+async def lottery_name_autocomplete(interaction: Interaction, current: str):
+    # DBから有効な宝くじ名を取得する想定
+    # 販売期限内 かつ remaining > 0
+    rows = []  # [(name, remaining)]
+    return [
+        app_commands.Choice(name=f"{name}（残り{remain}枚）", value=name)
+        for name, remain in rows if current in name
+    ][:25]
+
+async def lottery_name_all_autocomplete(interaction: Interaction, current: str):
+    # 削除用（期限切れ・売り切れ含む）
+    rows = []  # [name]
+    return [app_commands.Choice(name=name, value=name) for name in rows if current in name][:25]
+
+
+# ==============================
 # /宝くじ 設定
 # ==============================
 
@@ -605,6 +624,13 @@ def draw_lottery(setting: dict, count: int):
     total="合計枚数",
     end_date="販売期限 YYYYMMDD"
 )
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(name="追加", value="追加"),
+        app_commands.Choice(name="削除", value="削除")
+    ]
+)
+@app_commands.autocomplete(name=lottery_name_all_autocomplete)
 async def lottery_setting(
     interaction: Interaction,
     mode: str,
@@ -640,6 +666,7 @@ async def lottery_setting(
     name="宝くじの種類",
     count="購入枚数"
 )
+@app_commands.autocomplete(name=lottery_name_autocomplete)
 async def lottery(interaction: Interaction, name: str, count: int):
     await interaction.response.defer(ephemeral=True)
 
@@ -677,6 +704,7 @@ async def lottery(interaction: Interaction, name: str, count: int):
 # ・remaining=0 で売り切れ表示
 # ・end_date 超過で /宝くじ 候補から除外
 # ・全コマンド defer() 済み（タイムアウト対策）
+
 
     
     # バックアップ送信
