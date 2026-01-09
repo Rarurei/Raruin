@@ -535,6 +535,149 @@ async def login_bonus_cmd(interaction: discord.Interaction):
         msg = f"ログインボーナス！ **{reward} {CURRENCY_NAME}** を獲得しました。明日はもっと当たるといいですね！"
 
     await interaction.response.send_message(msg, ephemeral=True)
+
+    # 前提: discord.py 2.4.0 / app_commands 使用
+# 既存DB(main.db)に以下テーブルを追加する想定
+# lottery_settings, lottery_remaining
+
+import random
+import datetime
+from discord import app_commands, Interaction
+from discord.ext import commands
+
+bot = commands.Bot(command_prefix="!", intents=None)
+
+# ==============================
+# DB想定スキーマ（参考）
+# ==============================
+"""
+lottery_settings(
+  name TEXT PRIMARY KEY,
+  price INTEGER,
+  total INTEGER,
+  remaining INTEGER,
+  end_date TEXT,
+  rate1 INTEGER, prize1 INTEGER,
+  rate2 INTEGER, prize2 INTEGER,
+  rate3 INTEGER, prize3 INTEGER,
+  rate4 INTEGER, prize4 INTEGER,
+  rate5 INTEGER, prize5 INTEGER,
+  rate6 INTEGER, prize6 INTEGER
+)
+"""
+
+# ==============================
+# 共通関数
+# ==============================
+
+def today_yyyymmdd():
+    return int(datetime.datetime.now().strftime("%Y%m%d"))
+
+
+def draw_lottery(setting: dict, count: int):
+    results = {1:0,2:0,3:0,4:0,5:0,6:0,"lose":0}
+    reward = 0
+
+    for _ in range(count):
+        hit = False
+        for grade in range(1, 7):
+            rate = setting[f"rate{grade}"]
+            if rate > 0 and random.randint(1, rate) == 1:
+                results[grade] += 1
+                reward += setting[f"prize{grade}"]
+                hit = True
+                break
+        if not hit:
+            results["lose"] += 1
+
+    return results, reward
+
+
+# ==============================
+# /宝くじ 設定
+# ==============================
+
+@bot.tree.command(name="宝くじ設定", description="宝くじの追加・削除（管理者専用）")
+@app_commands.describe(
+    mode="追加 または 削除",
+    name="宝くじ名",
+    price="1枚あたりの金額",
+    total="合計枚数",
+    end_date="販売期限 YYYYMMDD"
+)
+async def lottery_setting(
+    interaction: Interaction,
+    mode: str,
+    name: str,
+    price: int = None,
+    total: int = None,
+    end_date: str = None,
+    rate1: int = 0, prize1: int = 0,
+    rate2: int = 0, prize2: int = 0,
+    rate3: int = 0, prize3: int = 0,
+    rate4: int = 0, prize4: int = 0,
+    rate5: int = 0, prize5: int = 0,
+    rate6: int = 0, prize6: int = 0,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if mode == "削除":
+        # DBから削除
+        pass
+    else:
+        # DBへ追加
+        pass
+
+    await interaction.followup.send("宝くじ設定を更新しました", ephemeral=True)
+
+
+# ==============================
+# /宝くじ 購入
+# ==============================
+
+@bot.tree.command(name="宝くじ", description="宝くじを購入")
+@app_commands.describe(
+    name="宝くじの種類",
+    count="購入枚数"
+)
+async def lottery(interaction: Interaction, name: str, count: int):
+    await interaction.response.defer(ephemeral=True)
+
+    # 設定取得
+    setting = {}  # DBから取得する想定
+
+    # 販売期限チェック
+    if int(setting["end_date"]) < today_yyyymmdd():
+        await interaction.followup.send("この宝くじは販売期限切れです", ephemeral=True)
+        return
+
+    if setting["remaining"] <= 0:
+        await interaction.followup.send("この宝くじは売り切れです", ephemeral=True)
+        return
+
+    count = min(count, setting["remaining"])
+
+    results, reward = draw_lottery(setting, count)
+
+    # 残り枚数更新 & 報酬付与
+    pass
+
+    msg = "抽選結果:\n"
+    for k, v in results.items():
+        msg += f"{k}等: {v}本\n" if k != "lose" else f"はずれ: {v}本\n"
+    msg += f"獲得Raruin: {reward}"
+
+    await interaction.followup.send(msg, ephemeral=True)
+
+
+# ==============================
+# 補足
+# ==============================
+# ・choice候補は autocomplete で DB 参照
+# ・remaining=0 で売り切れ表示
+# ・end_date 超過で /宝くじ 候補から除外
+# ・全コマンド defer() 済み（タイムアウト対策）
+
     
     # バックアップ送信
     backup_ch = bot.get_channel(BACKUP_CHANNEL_ID)
