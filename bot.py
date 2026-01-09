@@ -544,39 +544,35 @@ def lottery_doc(name):
 def today_yyyymmdd():
     return int(datetime.now().strftime("%Y%m%d"))
 
-def draw_lottery(setting: dict, count: int):
+def draw_unit_lottery(setting: dict, count: int):
+    """
+    ユニット（残り本数）方式の抽選
+    """
     results = {1:0, 2:0, 3:0, 4:0, 5:0, 6:0, "lose":0}
     reward = 0
-    for _ in range(count):
-        hit = False
-        for grade in range(1, 7):
-            rate = setting.get(f"rate{grade}", 0)
-            prize = setting.get(f"prize{grade}", 0)
-            if rate > 0 and random.randint(1, rate) == 1:
-                results[grade] += 1
-                reward += prize
-                hit = True
-                break
-        if not hit:
-            results["lose"] += 1
+    
+    # くじ箱の中身をシミュレート
+    pool = []
+    for grade in range(1, 7):
+        # 設定された「残り当選本数」をプールに追加
+        count_in_box = setting.get(f"count{grade}", 0)
+        pool.extend([grade] * count_in_box)
+    
+    # はずれの数を計算 (現在の総在庫 - 当たり合計)
+    current_remaining = setting.get("remaining", 0)
+    loses = max(0, current_remaining - len(pool))
+    pool.extend(["lose"] * loses)
+
+    # 購入枚数分、ランダムにシャッフルして取り出す
+    # random.sampleは重複なしで抽出するためユニット方式に最適
+    my_draws = random.sample(pool, min(count, len(pool)))
+
+    for res in my_draws:
+        results[res] += 1
+        if res != "lose":
+            reward += setting.get(f"prize{res}", 0)
+
     return results, reward
-
-# === オートコンプリート ===
-async def lottery_name_autocomplete(interaction: discord.Interaction, current: str):
-    # 販売期限内かつ在庫あり
-    today = today_yyyymmdd()
-    docs = db.collection("lottery_settings").stream()
-    choices = []
-    for doc in docs:
-        d = doc.to_dict()
-        if int(d.get("end_date", 0)) >= today and d.get("remaining", 0) > 0:
-            if current.lower() in doc.id.lower():
-                choices.append(app_commands.Choice(name=f"{doc.id} (残り{d['remaining']}枚)", value=doc.id))
-    return choices[:25]
-
-async def lottery_name_all_autocomplete(interaction: discord.Interaction, current: str):
-    docs = db.collection("lottery_settings").stream()
-    return [app_commands.Choice(name=doc.id, value=doc.id) for doc in docs if current.lower() in doc.id.lower()][:25]
 
 # === コマンド ===
 @tree.command(name="宝くじ設定", description="宝くじの追加・削除（管理者専用）")
@@ -586,9 +582,9 @@ async def lottery_name_all_autocomplete(interaction: discord.Interaction, curren
 async def lottery_setting(
     interaction: discord.Interaction, mode: str, name: str, 
     price: int=0, total: int=0, end_date: str="",
-    rate1: int=0, prize1: int=0, rate2: int=0, prize2: int=0,
-    rate3: int=0, prize3: int=0, rate4: int=0, prize4: int=0,
-    rate5: int=0, prize5: int=0, rate6: int=0, prize6: int=0
+    count1: int=0, prize1: int=0, count2: int=0, prize2: int=0,
+    count3: int=0, prize3: int=0, count4: int=0, prize4: int=0,
+    count5: int=0, prize5: int=0, count6: int=0, prize6: int=0
 ):
     if not is_admin(interaction.user):
         await interaction.response.send_message("管理者限定です", ephemeral=True); return
@@ -598,14 +594,19 @@ async def lottery_setting(
         lottery_doc(name).delete()
         await interaction.followup.send(f"宝くじ「{name}」を削除しました。")
     else:
+        # 当たりの合計が総枚数を超えていないかチェック
+        if (count1+count2+count3+count4+count5+count6) > total:
+            await interaction.followup.send("⚠️ エラー：当たりの合計本数が総枚数を超えています。", ephemeral=True)
+            return
+
         data = {
             "price": price, "total": total, "remaining": total, "end_date": end_date,
-            "rate1": rate1, "prize1": prize1, "rate2": rate2, "prize2": prize2,
-            "rate3": rate3, "prize3": prize3, "rate4": rate4, "prize4": prize4,
-            "rate5": rate5, "prize5": prize5, "rate6": rate6, "prize6": prize6
+            "count1": count1, "prize1": prize1, "count2": count2, "prize2": prize2,
+            "count3": count3, "prize3": prize3, "count4": count4, "prize4": prize4,
+            "count5": count5, "prize5": prize5, "count6": count6, "prize6": prize6
         }
         lottery_doc(name).set(data)
-        await interaction.followup.send(f"宝くじ「{name}」を設定しました。\n期限: {end_date} | 価格: {price} | 総数: {total}")
+        await interaction.followup.send(f"宝くじ「{name}」を設定しました。\n総数: {total}枚 (1等: {count1}本) | 価格: {price}")
 
 @tree.command(name="宝くじ", description="宝くじを購入して抽選します")
 @app_commands.describe(name="宝くじの種類", count="購入枚数")
@@ -616,44 +617,53 @@ async def lottery_buy(interaction: discord.Interaction, name: str, count: int):
     
     await interaction.response.defer(ephemeral=True)
     
-    l_doc = lottery_doc(name).get()
+    l_doc_ref = lottery_doc(name)
+    l_doc = l_doc_ref.get()
     if not l_doc.exists:
         await interaction.followup.send("指定された宝くじが見つかりません。"); return
     
     setting = l_doc.to_dict()
     
-    # チェック: 期限
     if int(setting.get("end_date", 0)) < today_yyyymmdd():
         await interaction.followup.send("この宝くじは販売期限切れです。"); return
     
-    # チェック: 在庫
     rem = setting.get("remaining", 0)
     if rem <= 0:
-        await interaction.followup.send("売り切れです。"); return
+        await interaction.followup.send("完売しました！"); return
     
     buy_count = min(count, rem)
     total_cost = buy_count * setting.get("price", 0)
     
-    # チェック: 所持金
     balance, _, _ = get_user_balance(interaction.user.id)
     if balance < total_cost:
         await interaction.followup.send(f"残高不足です。 (必要: {total_cost} {CURRENCY_NAME})"); return
 
     # 抽選実行
-    results, reward = draw_lottery(setting, buy_count)
+    results, reward = draw_unit_lottery(setting, buy_count)
     
     # DB更新
     change_balance(interaction.user.id, total_cost, is_add=False) # 支払い
-    change_balance(interaction.user.id, reward, is_add=True)       # 当選金
-    lottery_doc(name).update({"remaining": firestore.Increment(-buy_count)}) # 在庫減らす
+    if reward > 0:
+        change_balance(interaction.user.id, reward, is_add=True)   # 当選金
+    
+    # 在庫と当たり本数の更新
+    updates = {"remaining": firestore.Increment(-buy_count)}
+    for k in range(1, 7):
+        if results[k] > 0:
+            updates[f"count{k}"] = firestore.Increment(-results[k])
+    l_doc_ref.update(updates)
 
     # 結果表示
     msg = f"🛒 **{name}** を {buy_count} 枚購入しました！ (合計 {total_cost} {CURRENCY_NAME})\n\n"
     msg += "📊 **抽選結果**\n"
     for k in range(1, 7):
-        if results[k] > 0: msg += f"{k}等: {results[k]}本\n"
-    msg += f"はずれ: {results['lose']}本\n\n"
-    msg += f"💰 **合計獲得:** {reward} {CURRENCY_NAME}"
+        if results[k] > 0: msg += f"・{k}等: {results[k]}本\n"
+    
+    if results['lose'] > 0:
+        msg += f"・はずれ: {results['lose']}本\n"
+    
+    msg += f"\n💰 **合計獲得:** {reward} {CURRENCY_NAME}\n"
+    msg += f"📦 **残り在庫:** {rem - buy_count}枚"
     
     await interaction.followup.send(msg)
 
