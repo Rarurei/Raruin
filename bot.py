@@ -773,6 +773,70 @@ async def on_ready():
     except Exception as e:
         print(f"コマンド同期エラー: {e}")
 
+
+# === リアクション報酬設定 ===
+TARGET_CHANNEL_ID = 1452296570295816253  # 指定されたチャンネルID
+TARGET_EMOJI = "😎"  # 判定する絵文字
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    # 指定のチャンネル以外は無視
+    if payload.channel_id != TARGET_CHANNEL_ID:
+        return
+
+    # 😎 以外のリアクションは無視
+    if str(payload.emoji) != TARGET_EMOJI:
+        return
+
+    # リアクションしたユーザーを取得
+    guild = bot.get_guild(payload.guild_id)
+    member = guild.get_member(payload.user_id)
+    
+    # ボット自身のリアクションは無視
+    if member.bot:
+        return
+
+    # メッセージを取得
+    channel = bot.get_channel(payload.channel_id)
+    message = await channel.fetch_message(payload.message_id)
+
+    # メッセージの送信者が管理者（is_admin）かチェック
+    # ※is_admin関数が定義されている前提です
+    if not is_admin(message.author):
+        return
+
+    # 重複付与の防止（Firestoreで管理）
+    # コレクション "reaction_rewards" に "メッセージID_ユーザーID" で保存
+    reward_id = f"{payload.message_id}_{payload.user_id}"
+    reward_ref = db.collection("reaction_rewards").document(reward_id)
+
+    if reward_ref.get().exists:
+        # すでにこのメッセージで報酬を受け取っている場合は何もしない
+        return
+
+    # 1〜100,000 Raruinをランダムに決定
+    reward_amount = random.randint(1, 100000)
+
+    # 報酬を付与（既存のchange_balance関数を使用）
+    change_balance(payload.user_id, reward_amount, is_add=True)
+
+    # 付与済みフラグをDBに保存
+    reward_ref.set({
+        "user_id": payload.user_id,
+        "message_id": payload.message_id,
+        "amount": reward_amount,
+        "timestamp": datetime.now()
+    })
+
+    # ユーザーへDMを送信
+    try:
+        await member.send(f"撮影に参加したので {reward_amount} {CURRENCY_NAME} 獲得しました！")
+    except discord.Forbidden:
+        # DMが閉鎖されている場合
+        print(f"ユーザー {member.name} にDMを送信できませんでした。")
+    except Exception as e:
+        print(f"DM送信エラー: {e}")
+
 # ---- Flask keep-alive ----
 app = Flask('')
 
