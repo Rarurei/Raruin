@@ -268,25 +268,22 @@ class RankingPagination(discord.ui.View):
             await interaction.response.send_message("最後のページです", ephemeral=True)
 
 @tree.command(name="ランキング", description=f"{CURRENCY_NAME}ランキング")
-@app_commands.checks.has_any_role(1408273149199650867)
 async def ranking_cmd(interaction: discord.Interaction):
-    # 【強制ガード】ロールIDを持っていない場合は実行させない
     target_role_id = 1408273149199650867
+    
+    # 【自動削除】ロールを持っていない場合、Firestoreからその人のデータを消す
     if not any(role.id == target_role_id for role in interaction.user.roles):
-        await interaction.response.send_message("❌ このコマンドを実行する権限がありません。", ephemeral=True)
+        user_doc(interaction.user.id).delete() # データを削除
+        await interaction.response.send_message("❌ 認証ロールがないため、データをリセットしました。実行できません。", ephemeral=True)
         return
 
-    # タイムアウト対策
     await interaction.response.defer(ephemeral=True)
-    
     users = []
     for doc in db.collection("users").stream():
         data = doc.to_dict()
         users.append({**data, "user_id": int(doc.id)})
     
-    # 残高順に並び替え
     users.sort(key=lambda x: x.get('balance', 0), reverse=True)
-    
     if not users:
         await interaction.followup.send("データがありません。")
         return
@@ -296,12 +293,13 @@ async def ranking_cmd(interaction: discord.Interaction):
     
 @tree.command(name="渡す", description=f"ユーザーに {CURRENCY_NAME} を渡す")
 @app_commands.describe(target="渡す相手", amount=f"{CURRENCY_NAME}額")
-@app_commands.checks.has_any_role(1408273149199650867)
 async def transfer_cmd(interaction: discord.Interaction, target: discord.Member, amount: int):
-    # 【強制ガード】ロールIDを持っていない場合は実行させない
     target_role_id = 1408273149199650867
+    
+    # 【自動削除】
     if not any(role.id == target_role_id for role in interaction.user.roles):
-        await interaction.response.send_message("❌ このコマンドを実行する権限がありません。", ephemeral=True)
+        user_doc(interaction.user.id).delete()
+        await interaction.response.send_message("❌ 認証ロールがないため、データをリセットしました。", ephemeral=True)
         return
 
     if target.id == interaction.user.id or amount <= 0:
@@ -314,10 +312,6 @@ async def transfer_cmd(interaction: discord.Interaction, target: discord.Member,
     change_balance(interaction.user.id, amount, is_add=False)
     change_balance(target.id, amount, is_add=True)
     
-    now = datetime.now()
-    try:
-        await target.send(f"{interaction.user.display_name} さんから {amount}{CURRENCY_NAME} を受け取りました\n日時: {now.strftime('%m月%d日 %H:%M')}")
-    except: pass
     await interaction.response.send_message(f"{target.display_name} に {amount}{CURRENCY_NAME} 渡しました", ephemeral=True)
 
 @tree.command(name="ショップ一覧", description="ショップ一覧（10件/ページ）")
@@ -441,17 +435,23 @@ async def item_list_cmd(interaction, page:int=1):
 @tree.command(name="アイテム渡す", description="所持アイテムを他人に渡す")
 @app_commands.describe(target="渡す相手", item="渡すアイテム")
 @app_commands.autocomplete(item=myitem_key_autocomplete)
-@app_commands.checks.has_any_role(1408273149199650867)
 async def item_transfer_cmd(interaction: discord.Interaction, target: discord.Member, item: str):
-    # 【強制ガード】ロールIDを持っていない場合は実行させない
     target_role_id = 1408273149199650867
+    
+    # 【自動削除】
     if not any(role.id == target_role_id for role in interaction.user.roles):
-        await interaction.response.send_message("❌ このコマンドを実行する権限がありません。", ephemeral=True)
+        user_doc(interaction.user.id).delete()
+        # アイテムコレクションも消す場合は以下を追加
+        for sub_doc in user_doc(interaction.user.id).collection("items").stream():
+            sub_doc.reference.delete()
+            
+        await interaction.response.send_message("❌ 認証ロールがないため、全アイテムとデータを削除しました。", ephemeral=True)
         return
 
     if target.id == interaction.user.id or ":" not in item:
         await interaction.response.send_message("不正な指定です", ephemeral=True); return
     
+    # (以下、元々のアイテム転送処理)
     shop_name, product_name = item.split(":", 1)
     from_ref = user_item_doc(interaction.user.id, shop_name, product_name)
     to_ref = user_item_doc(target.id, shop_name, product_name)
@@ -460,28 +460,21 @@ async def item_transfer_cmd(interaction: discord.Interaction, target: discord.Me
     def do_transfer(transaction):
         from_snap = from_ref.get(transaction=transaction)
         to_snap = to_ref.get(transaction=transaction)
-        
         if not from_snap.exists: return False
-        
         data = from_snap.to_dict()
         now_amt = data.get("amount", 0)
         if now_amt < 1: return False
-
-        if now_amt == 1:
-            transaction.delete(from_ref)
-        else:
-            transaction.update(from_ref, {"amount": now_amt - 1})
-        
-        if to_snap.exists:
-            transaction.update(to_ref, {"amount": to_snap.to_dict().get("amount", 0) + 1})
-        else:
-            transaction.set(to_ref, {"amount": 1, "shop_name": shop_name, "product_name": product_name})
+        if now_amt == 1: transaction.delete(from_ref)
+        else: transaction.update(from_ref, {"amount": now_amt - 1})
+        if to_snap.exists: transaction.update(to_ref, {"amount": to_snap.to_dict().get("amount", 0) + 1})
+        else: transaction.set(to_ref, {"amount": 1, "shop_name": shop_name, "product_name": product_name})
         return True
 
     if do_transfer(db.transaction()):
         await interaction.response.send_message(f"{target.display_name}に{product_name}を1個渡しました", ephemeral=True)
     else:
         await interaction.response.send_message("アイテムを持っていません", ephemeral=True)
+
 @tree.command(name="ログイン", description="1日1回限定！ランダムで Raruin を獲得します")
 async def login_bonus_cmd(interaction: discord.Interaction):
     user_id = interaction.user.id
