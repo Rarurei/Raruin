@@ -268,8 +268,9 @@ class RankingPagination(discord.ui.View):
             await interaction.response.send_message("最後のページです", ephemeral=True)
 
 @tree.command(name="ランキング", description=f"{CURRENCY_NAME}ランキング")
+@app_commands.checks.has_any_role(1408273149199650867)
 async def ranking_cmd(interaction: discord.Interaction):
-    # タイムアウト対策（データ取得に時間がかかる場合があるため）
+    # タイムアウト対策
     await interaction.response.defer(ephemeral=True)
     
     users = []
@@ -289,6 +290,7 @@ async def ranking_cmd(interaction: discord.Interaction):
     
 @tree.command(name="渡す", description=f"ユーザーに {CURRENCY_NAME} を渡す")
 @app_commands.describe(target="渡す相手", amount=f"{CURRENCY_NAME}額")
+@app_commands.checks.has_any_role(1408273149199650867)
 async def transfer_cmd(interaction: discord.Interaction, target: discord.Member, amount: int):
     if target.id == interaction.user.id or amount <= 0:
         await interaction.response.send_message("不正な指定です", ephemeral=True); return
@@ -427,6 +429,7 @@ async def item_list_cmd(interaction, page:int=1):
 @tree.command(name="アイテム渡す", description="所持アイテムを他人に渡す")
 @app_commands.describe(target="渡す相手", item="渡すアイテム")
 @app_commands.autocomplete(item=myitem_key_autocomplete)
+@app_commands.checks.has_any_role(1408273149199650867)
 async def item_transfer_cmd(interaction: discord.Interaction, target: discord.Member, item: str):
     if target.id == interaction.user.id or ":" not in item:
         await interaction.response.send_message("不正な指定です", ephemeral=True); return
@@ -437,7 +440,6 @@ async def item_transfer_cmd(interaction: discord.Interaction, target: discord.Me
 
     @firestore.transactional
     def do_transfer(transaction):
-        # 1. まず必要なデータをすべて読み込む（Read）
         from_snap = from_ref.get(transaction=transaction)
         to_snap = to_ref.get(transaction=transaction)
         
@@ -447,7 +449,6 @@ async def item_transfer_cmd(interaction: discord.Interaction, target: discord.Me
         now_amt = data.get("amount", 0)
         if now_amt < 1: return False
 
-        # 2. すべて読み込み終わってから書き込む（Write）
         if now_amt == 1:
             transaction.delete(from_ref)
         else:
