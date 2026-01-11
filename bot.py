@@ -270,6 +270,12 @@ class RankingPagination(discord.ui.View):
 @tree.command(name="ランキング", description=f"{CURRENCY_NAME}ランキング")
 @app_commands.checks.has_any_role(1408273149199650867)
 async def ranking_cmd(interaction: discord.Interaction):
+    # 【強制ガード】ロールIDを持っていない場合は実行させない
+    target_role_id = 1408273149199650867
+    if not any(role.id == target_role_id for role in interaction.user.roles):
+        await interaction.response.send_message("❌ このコマンドを実行する権限がありません。", ephemeral=True)
+        return
+
     # タイムアウト対策
     await interaction.response.defer(ephemeral=True)
     
@@ -292,6 +298,12 @@ async def ranking_cmd(interaction: discord.Interaction):
 @app_commands.describe(target="渡す相手", amount=f"{CURRENCY_NAME}額")
 @app_commands.checks.has_any_role(1408273149199650867)
 async def transfer_cmd(interaction: discord.Interaction, target: discord.Member, amount: int):
+    # 【強制ガード】ロールIDを持っていない場合は実行させない
+    target_role_id = 1408273149199650867
+    if not any(role.id == target_role_id for role in interaction.user.roles):
+        await interaction.response.send_message("❌ このコマンドを実行する権限がありません。", ephemeral=True)
+        return
+
     if target.id == interaction.user.id or amount <= 0:
         await interaction.response.send_message("不正な指定です", ephemeral=True); return
     
@@ -431,6 +443,12 @@ async def item_list_cmd(interaction, page:int=1):
 @app_commands.autocomplete(item=myitem_key_autocomplete)
 @app_commands.checks.has_any_role(1408273149199650867)
 async def item_transfer_cmd(interaction: discord.Interaction, target: discord.Member, item: str):
+    # 【強制ガード】ロールIDを持っていない場合は実行させない
+    target_role_id = 1408273149199650867
+    if not any(role.id == target_role_id for role in interaction.user.roles):
+        await interaction.response.send_message("❌ このコマンドを実行する権限がありません。", ephemeral=True)
+        return
+
     if target.id == interaction.user.id or ":" not in item:
         await interaction.response.send_message("不正な指定です", ephemeral=True); return
     
@@ -464,39 +482,6 @@ async def item_transfer_cmd(interaction: discord.Interaction, target: discord.Me
         await interaction.response.send_message(f"{target.display_name}に{product_name}を1個渡しました", ephemeral=True)
     else:
         await interaction.response.send_message("アイテムを持っていません", ephemeral=True)
-
-@tree.command(name="アイテム使う", description="所持アイテムを使用")
-@app_commands.describe(item="使うアイテム")
-@app_commands.autocomplete(item=myitem_key_autocomplete)
-async def use_item_cmd(interaction: discord.Interaction, item: str):
-    if ":" not in item:
-        await interaction.response.send_message("不正な指定", ephemeral=True); return
-    shop_name, product_name = item.split(":", 1)
-    ref = user_item_doc(interaction.user.id, shop_name, product_name)
-
-    @firestore.transactional
-    def do_use(transaction):
-        snap = ref.get(transaction=transaction)
-        if not snap.exists: return False
-        data = snap.to_dict()
-        amt = data.get("amount", 0)
-        if amt < 1: return False
-        
-        if amt == 1:
-            transaction.delete(ref)
-        else:
-            transaction.update(ref, {"amount": amt - 1})
-        return True
-
-    if do_use(db.transaction()):
-        # メンション形式 <@ユーザーID> に修正
-        msg = f"<@{interaction.user.id}> が {product_name}（{shop_name}）を使用しました！"
-        used_ch = bot.get_channel(ITEM_USED_CHANNEL_ID)
-        if used_ch: await used_ch.send(msg)
-        await interaction.response.send_message(f"{product_name} を使用しました。", ephemeral=True)
-    else:
-        await interaction.response.send_message("アイテムを持っていません", ephemeral=True)
-
 @tree.command(name="ログイン", description="1日1回限定！ランダムで Raruin を獲得します")
 async def login_bonus_cmd(interaction: discord.Interaction):
     user_id = interaction.user.id
@@ -536,6 +521,46 @@ async def login_bonus_cmd(interaction: discord.Interaction):
         msg = f"ログインボーナス！ **{reward} {CURRENCY_NAME}** を獲得しました。明日はもっと当たるといいですね！"
 
     await interaction.response.send_message(msg, ephemeral=True)
+
+@tree.command(name="データ整理", description="認証ロールがないユーザーのデータをFirestoreから削除します（管理者用）")
+async def cleanup_data(interaction: discord.Interaction):
+    if not is_admin(interaction.user):
+        await interaction.response.send_message("管理者限定です", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    
+    target_role_id = 1408273149199650867
+    guild = interaction.guild
+    users_ref = db.collection("users")
+    
+    deleted_count = 0
+    total_count = 0
+
+    # Firestoreから全ユーザーを取得
+    docs = users_ref.stream()
+
+    for doc in docs:
+        total_count += 1
+        user_id_str = doc.id
+        try:
+            user_id = int(user_id_str)
+            member = guild.get_member(user_id)
+
+            # メンバーがサーバーにいない、または特定のロールを持っていない場合
+            if member is None or not any(role.id == target_role_id for role in member.roles):
+                # Firestoreから削除
+                users_ref.document(user_id_str).delete()
+                deleted_count += 1
+        except Exception as e:
+            print(f"Error processing {user_id_str}: {e}")
+
+    await interaction.followup.send(
+        f"データ整理が完了しました。\n"
+        f"チェック対象: {total_count}件\n"
+        f"削除された非認証ユーザー: {deleted_count}件", 
+        ephemeral=True
+    )
 
 # ==============================
 # 宝くじシステム（ユニット方式・Firestore版）
