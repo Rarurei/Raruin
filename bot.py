@@ -29,15 +29,21 @@ ADMIN_IDS = [int(x.strip()) for x in admin_raw.split(",") if x.strip().isdigit()
 BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID") or 0)
 ITEM_USED_CHANNEL_ID = int(os.getenv("ITEM_USED_CHANNEL_ID") or 0)
 
-# Google認証設定 (NoneTypeエラー回避策)
+# Google認証設定
 google_creds = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
 if google_creds:
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = google_creds
 else:
-    # RenderのSecret Fileのデフォルトパス
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/etc/secrets/google-key.json"
+    # RenderのSecret Fileの標準的な場所を指定
+    secret_path = "/etc/secrets/google-key.json"
+    if os.path.exists(secret_path):
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = secret_path
+    else:
+        # どちらも見つからない場合
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "google-key.json"
 
-print(f"Google Credentials: {os.environ['GOOGLE_APPLICATION_CREDENTIALS']}")
+print(f"Final Credentials Path: {os.environ['GOOGLE_APPLICATION_CREDENTIALS']}")
 CURRENCY_NAME = "Raruin"
 
 # === Firestore ===
@@ -898,9 +904,10 @@ def keep_alive():
 # Flaskなどのサーバーを別スレッドで動かす仕組みが必要です。
 # もし Flask を使っているなら、以下のように Bot を起動しているか確認してください。
 
+# --- プログラムの下のほう ---
 if __name__ == "__main__":
-    # ここで Bot を起動
     try:
-        client.run(TOKEN)
+        # client ではなく bot に書き換える
+        bot.run(TOKEN) 
     except Exception as e:
         print(f"Bot起動エラー: {e}")
