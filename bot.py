@@ -850,19 +850,35 @@ async def on_raw_reaction_add(payload):
         except Exception as e:
             print(f"通知送信エラー: {e}")
 
-# ---- Flask keep-alive ----
-app = Flask('')
+import threading
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-@app.route('/')
-def home():
-    return "Bot is alive!"
+# --- 最軽量のWebサーバー設定 ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    # 外部からのアクセス（GET）があった時の処理
+    def do_GET(self):
+        self.send_response(200) # 正常応答を返す
+        self.end_headers()
+        self.wfile.write(b"Bot is active") # 画面に表示する文字
 
-def run():
-    app.run(host='0.0.0.0', port=10000)
+    # ログ（アクセス履歴）を非表示にする（軽量化）
+    def log_message(self, format, *args):
+        return
+
+def run_server():
+    # Renderから指定されたポート、なければ10000番を使用
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server.serve_forever()
 
 def keep_alive():
-    t = threading.Thread(target=run)
+    # daemon=Trueにすることで、Bot終了時にサーバーも一緒に終了するようにする
+    t = threading.Thread(target=run_server, daemon=True)
     t.start()
 
-keep_alive()
-bot.run(TOKEN)
+# --- 起動処理 ---
+if __name__ == "__main__":
+    keep_alive() # Webサーバーを裏側で起動
+    # ここにBotの起動コードを書く
+    # bot.run(TOKEN)
