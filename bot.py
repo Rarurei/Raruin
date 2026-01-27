@@ -16,34 +16,30 @@ from datetime import date
 # === 環境設定 ===
 load_dotenv()
 
-# --- Discord基本設定 ---
+# Discordトークンのチェック
 TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    print("【致命的エラー】DISCORD_TOKEN が設定されていません。")
 
-# ADMIN_ID が空でもエラーにならないようにする
-admin_env = os.getenv("ADMIN_ID", "")
-ADMIN_IDS = [int(x.strip()) for x in admin_env.split(",") if x.strip().isdigit()]
+# ADMIN_ID (空なら空リスト)
+admin_raw = os.getenv("ADMIN_ID", "")
+ADMIN_IDS = [int(x.strip()) for x in admin_raw.split(",") if x.strip().isdigit()]
 
-# ID系は、設定がない場合に 0 を入れることで int() のエラーを防ぐ
+# 各種チャンネルID (設定がなければ0にする)
 BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID") or 0)
 ITEM_USED_CHANNEL_ID = int(os.getenv("ITEM_USED_CHANNEL_ID") or 0)
 
-# --- Google Cloud (Firestore) 設定 ---
-# ここが今回のエラーの原因箇所です
+# Google認証設定 (NoneTypeエラー回避策)
 google_creds = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-
 if google_creds:
-    # 環境変数が設定されていればそれを使う
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = google_creds
 else:
-    # 設定がない場合、RenderのSecret Fileの標準パスを直接指定する
-    secret_file_path = "/etc/secrets/google-key.json"
-    if os.path.exists(secret_file_path):
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = secret_file_path
-    else:
-        print("【警告】Googleの認証キーファイルが見つかりません。")
+    # RenderのSecret Fileのデフォルトパス
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/etc/secrets/google-key.json"
 
-# --- その他設定 ---
+print(f"Google Credentials: {os.environ['GOOGLE_APPLICATION_CREDENTIALS']}")
 CURRENCY_NAME = "Raruin"
+
 # === Firestore ===
 db = firestore.Client()
 
@@ -899,8 +895,12 @@ def keep_alive():
     t = threading.Thread(target=run_server, daemon=True)
     t.start()
 
-# --- 起動処理 ---
+# Flaskなどのサーバーを別スレッドで動かす仕組みが必要です。
+# もし Flask を使っているなら、以下のように Bot を起動しているか確認してください。
+
 if __name__ == "__main__":
-    keep_alive() # Webサーバーを裏側で起動
-    # ここにBotの起動コードを書く
-    # bot.run(TOKEN)
+    # ここで Bot を起動
+    try:
+        client.run(TOKEN)
+    except Exception as e:
+        print(f"Bot起動エラー: {e}")
