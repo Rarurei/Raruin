@@ -733,6 +733,9 @@ async def lottery_buy(interaction: discord.Interaction, name: str, count: int):
         }
         await backup_ch.send(f"【Raruin Item Used Log】\n```json\n{json.dumps(backup, ensure_ascii=False, indent=2)}\n```")
 
+# 通知を送るチャンネルID
+NOTIFICATION_CHANNEL_ID = 1458775432726839464
+
 # --- メッセージ報酬の処理 ---
 @bot.event
 async def on_message(message):
@@ -762,36 +765,27 @@ async def on_voice_state_update(member, before, after):
         if join_time:
             # 退出時間を取得
             leave_time = datetime.now()
-            # 差分（秒）を計算
             diff = leave_time - join_time
             seconds = diff.total_seconds()
-            
-            # 分を計算（1.0を足すなどの中途半端な補正をせず、純粋に60で割る）
             minutes = int(seconds // 60)
             
-            # 【確認用】Botのコンソールに実際の秒数と分数を出力する
             print(f"[DEBUG] {member.display_name}: 通話時間 {seconds:.1f}秒 -> {minutes}分と判定")
 
             if minutes >= 1:
                 reward = minutes * 60
                 change_balance(member.id, reward, is_add=True)
                 
-                try:
-                    await member.send(f"通話報酬: {minutes}分の参加で {reward} {CURRENCY_NAME} を獲得しました！")
-                except:
-                    pass
+                # 【修正】DMをやめて指定チャンネルに通知
+                channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
+                if channel:
+                    try:
+                        # メンション付きで通知
+                        await channel.send(f"🎙️ {member.mention} が {minutes}分間の通話で {reward} {CURRENCY_NAME} を獲得しました！")
+                    except Exception as e:
+                        print(f"通知送信エラー: {e}")
+
             else:
                 print(f"[DEBUG] 1分未満のため報酬なし")
-                
-@bot.event
-async def on_ready():
-    print(f"Bot activated: {bot.user} ({bot.user.id})")
-    try:
-        synced = await tree.sync()
-        print(f"Slashコマンド {len(synced)} 個同期")
-    except Exception as e:
-        print(f"コマンド同期エラー: {e}")
-
 
 # === リアクション報酬設定 ===
 TARGET_CHANNEL_ID = 1452296570295816253  # 指定されたチャンネルID
@@ -809,34 +803,35 @@ async def on_raw_reaction_add(payload):
 
     # リアクションしたユーザーを取得
     guild = bot.get_guild(payload.guild_id)
+    if not guild: return
     member = guild.get_member(payload.user_id)
     
-    # ボット自身のリアクションは無視
-    if member.bot:
+    # ボット自身のリアクションやメンバー取得失敗時は無視
+    if not member or member.bot:
         return
 
     # メッセージを取得
     channel = bot.get_channel(payload.channel_id)
-    message = await channel.fetch_message(payload.message_id)
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except:
+        return # メッセージが見つからない場合
 
     # メッセージの送信者が管理者（is_admin）かチェック
-    # ※is_admin関数が定義されている前提です
     if not is_admin(message.author):
         return
 
     # 重複付与の防止（Firestoreで管理）
-    # コレクション "reaction_rewards" に "メッセージID_ユーザーID" で保存
     reward_id = f"{payload.message_id}_{payload.user_id}"
     reward_ref = db.collection("reaction_rewards").document(reward_id)
 
     if reward_ref.get().exists:
-        # すでにこのメッセージで報酬を受け取っている場合は何もしない
         return
 
     # 1〜100,000 Raruinをランダムに決定
     reward_amount = random.randint(1, 100000)
 
-    # 報酬を付与（既存のchange_balance関数を使用）
+    # 報酬を付与
     change_balance(payload.user_id, reward_amount, is_add=True)
 
     # 付与済みフラグをDBに保存
@@ -847,14 +842,13 @@ async def on_raw_reaction_add(payload):
         "timestamp": datetime.now()
     })
 
-    # ユーザーへDMを送信
-    try:
-        await member.send(f"撮影に参加したので {reward_amount} {CURRENCY_NAME} 獲得しました！")
-    except discord.Forbidden:
-        # DMが閉鎖されている場合
-        print(f"ユーザー {member.name} にDMを送信できませんでした。")
-    except Exception as e:
-        print(f"DM送信エラー: {e}")
+    # 【修正】DMをやめて指定チャンネルに通知
+    notify_channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
+    if notify_channel:
+        try:
+            await notify_channel.send(f"📸 {member.mention} が撮影に参加して {reward_amount} {CURRENCY_NAME} を獲得しました！")
+        except Exception as e:
+            print(f"通知送信エラー: {e}")
 
 # ---- Flask keep-alive ----
 app = Flask('')
