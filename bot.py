@@ -15,13 +15,35 @@ from datetime import date
 
 # === 環境設定 ===
 load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_ID", "").split(",")]
-BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID"))
-ITEM_USED_CHANNEL_ID = int(os.getenv("ITEM_USED_CHANNEL_ID"))
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-CURRENCY_NAME = "Raruin"
 
+# --- Discord基本設定 ---
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+# ADMIN_ID が空でもエラーにならないようにする
+admin_env = os.getenv("ADMIN_ID", "")
+ADMIN_IDS = [int(x.strip()) for x in admin_env.split(",") if x.strip().isdigit()]
+
+# ID系は、設定がない場合に 0 を入れることで int() のエラーを防ぐ
+BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID") or 0)
+ITEM_USED_CHANNEL_ID = int(os.getenv("ITEM_USED_CHANNEL_ID") or 0)
+
+# --- Google Cloud (Firestore) 設定 ---
+# ここが今回のエラーの原因箇所です
+google_creds = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+if google_creds:
+    # 環境変数が設定されていればそれを使う
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = google_creds
+else:
+    # 設定がない場合、RenderのSecret Fileの標準パスを直接指定する
+    secret_file_path = "/etc/secrets/google-key.json"
+    if os.path.exists(secret_file_path):
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = secret_file_path
+    else:
+        print("【警告】Googleの認証キーファイルが見つかりません。")
+
+# --- その他設定 ---
+CURRENCY_NAME = "Raruin"
 # === Firestore ===
 db = firestore.Client()
 
