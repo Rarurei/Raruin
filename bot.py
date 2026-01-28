@@ -874,40 +874,38 @@ async def on_raw_reaction_add(payload):
         except Exception as e:
             print(f"通知送信エラー: {e}")
 
-import threading
 import os
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # --- 最軽量のWebサーバー設定 ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    # 外部からのアクセス（GET）があった時の処理
     def do_GET(self):
-        self.send_response(200) # 正常応答を返す
+        self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is active") # 画面に表示する文字
+        self.wfile.write(b"Bot is active")
 
-    # ログ（アクセス履歴）を非表示にする（軽量化）
     def log_message(self, format, *args):
         return
 
 def run_server():
-    # Renderから指定されたポート、なければ10000番を使用
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
     server.serve_forever()
 
 def keep_alive():
-    # daemon=Trueにすることで、Bot終了時にサーバーも一緒に終了するようにする
     t = threading.Thread(target=run_server, daemon=True)
     t.start()
 
-# Flaskなどのサーバーを別スレッドで動かす仕組みが必要です。
-# もし Flask を使っているなら、以下のように Bot を起動しているか確認してください。
-
-# --- プログラムの下のほう ---
+# --- ここが修正箇所です ---
 if __name__ == "__main__":
+    # 1. まず「keep_alive()」を実行して、Webサーバーを裏で動かす
+    keep_alive()
+    
+    # 2. その後にBotをログインさせる
     try:
-        # client ではなく bot に書き換える
+        # ※注意: 上の方で bot = commands.Bot(...) と書いているなら bot.run
+        # もし client = ... と書いているなら client.run にしてください
         bot.run(TOKEN) 
     except Exception as e:
         print(f"Bot起動エラー: {e}")
