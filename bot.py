@@ -138,6 +138,17 @@ async def product_autocomplete(interaction: discord.Interaction, current: str):
     
     return prods[:25]
 
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user.name}")
+    try:
+        # スラッシュコマンドをDiscordに送信して登録する
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} command(s)")
+    except Exception as e:
+        print(f"Sync error: {e}")
+        
 # --- コマンド群 ---
 @tree.command(name="リセット", description=f"ユーザーまたはロールの残高・統計をリセット（管理者）")
 @app_commands.describe(target="対象（ユーザーまたはロール）")
