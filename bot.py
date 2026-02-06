@@ -12,6 +12,7 @@ from google.cloud.firestore_v1 import Transaction
 from typing import Union, List
 import random
 from datetime import date
+import asyncio
 
 # === 環境設定 ===
 load_dotenv()
@@ -784,11 +785,41 @@ async def on_message(message):
     # スラッシュコマンドを正常に動作させるために必須
     await bot.process_commands(message)
 
-# --- 通話報酬の処理 ---
+# --- 通話報酬の処理（通話通知のみスパム対策版） ---
 voice_times = {}
+voice_notification_queue = []  # 通知を溜めるリスト
+is_voice_queue_running = False # タイマーが動いているかどうかのフラグ
+
+async def send_voice_notifications(channel):
+    """15秒後にまとめて通知を送る関数"""
+    global voice_notification_queue, is_voice_queue_running
+    
+    # 15秒待機（この間に他の人が抜けてもキューに溜まる）
+    await asyncio.sleep(15)
+    
+    if voice_notification_queue:
+        # メッセージを改行で結合して1つのメッセージにする
+        content = "\n".join(voice_notification_queue)
+        
+        # 文字数制限対策 (念のため1900文字でカット)
+        if len(content) > 1900:
+            content = content[:1900] + "\n...(他多数)"
+            
+        try:
+            await channel.send(content)
+        except Exception as e:
+            print(f"通話通知の送信に失敗: {e}")
+            
+        # 送信したらリストを空にする
+        voice_notification_queue = []
+        
+    # フラグを下ろす（次の通知待ちを受け付けられるようにする）
+    is_voice_queue_running = False
 
 @bot.event
 async def on_voice_state_update(member, before, after):
+    global is_voice_queue_running
+
     # --- 入室時の処理 ---
     if not before.channel and after.channel:
         voice_times[member.id] = datetime.now()
@@ -798,7 +829,6 @@ async def on_voice_state_update(member, before, after):
     elif before.channel and not after.channel:
         join_time = voice_times.pop(member.id, None)
         if join_time:
-            # 退出時間を取得
             leave_time = datetime.now()
             diff = leave_time - join_time
             seconds = diff.total_seconds()
@@ -810,15 +840,16 @@ async def on_voice_state_update(member, before, after):
                 reward = minutes * 60
                 change_balance(member.id, reward, is_add=True)
                 
-                # 【修正】DMをやめて指定チャンネルに通知
-                channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
-                if channel:
-                    try:
-                        # メンション付きで通知
-                        await channel.send(f"🎙️ {member.mention} が {minutes}分間の通話で {reward} {CURRENCY_NAME} を獲得しました！")
-                    except Exception as e:
-                        print(f"通知送信エラー: {e}")
-
+                # --- 即送信せずリストに入れる ---
+                msg = f"🎙️ {member.mention} が {minutes}分間の通話で {reward} {CURRENCY_NAME} を獲得しました！"
+                voice_notification_queue.append(msg)
+                
+                # もしタイマーが動いていなければ、タイマーを起動する（最初の1人が抜けた時だけ動く）
+                if not is_voice_queue_running:
+                    channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
+                    if channel:
+                        is_voice_queue_running = True
+                        asyncio.create_task(send_voice_notifications(channel))
             else:
                 print(f"[DEBUG] 1分未満のため報酬なし")
 
