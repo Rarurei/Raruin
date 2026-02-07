@@ -923,11 +923,18 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # --- 最軽量のWebサーバー設定 ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        """ブラウザや通常のアクセス用"""
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot is active")
 
+    def do_HEAD(self):
+        """UptimeRobotの生存確認（HEADリクエスト）用。これがないと501エラーになります"""
+        self.send_response(200)
+        self.end_headers()
+
     def log_message(self, format, *args):
+        """ログをスッキリさせるためアクセスログを非表示にする"""
         return
 
 def run_server():
